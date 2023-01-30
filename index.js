@@ -8,7 +8,7 @@ const admin = require('firebase-admin');
 admin.initializeApp();
 const firestore = admin.firestore();
 
-// Retrieve aggregated data from OpenCitations and Crossref
+// Retrieve aggregated data from OpenCitations and CrossRef
 // deploy with: "gcloud functions deploy pure-publications --gen2 --runtime=nodejs18 --region=europe-west1 --source=. --entry-point=pure-publications --trigger-http --allow-unauthenticated"
 functions.http('pure-publications', async (req, res) => {
     const doi = req.query.doi;
@@ -35,31 +35,42 @@ functions.http('pure-publications', async (req, res) => {
         res.send(doiDoc.data().data);
     } else {
         const data = { doi: doi };
-        // load data from OpenCitations
-        const urlOpenCitations = `https://opencitations.net/index/coci/api/v1/metadata/${doi}`;
-        const reponseOpenCitations = await fetch(urlOpenCitations, {
+
+        // load metadata from Crossref 
+        const reponseCrossref = await fetch(`https://api.crossref.org/v1/works/${doi}?mailto=fabian.beck@uni-bamberg.de`);
+        const dataCrossref = reponseCrossref.status === 200 ? (await reponseCrossref.json())?.message : null;
+        data.title = dataCrossref?.title?.[0];
+        data.subtitle = dataCrossref?.subtitle?.[0];
+        data.year = dataCrossref?.created?.['date-parts']?.[0]?.[0] || doi.match(/\.((19|20)\d\d)\./)?.[1];
+        data.author = dataCrossref?.author?.reduce((acc, author) => acc + author.family + ", " + author.given + "; ", "").slice(0, -2);
+        data.container = dataCrossref?.["container-title"]?.[0];
+        data.volume = dataCrossref?.volume;
+        data.issue = dataCrossref?.issue;
+        data.page = dataCrossref?.page;
+        data.abstract = dataCrossref?.abstract;
+
+        // load refernces/citations from OpenCitations
+        data.reference = "";
+        const reponseOCReferences = await fetch(`https://opencitations.net/index/coci/api/v1/references/${doi}`, {
             headers: {
                 authorization: "aa9da96d-3c7b-49c1-a2d8-1c2d01ae10a5",
             }
         });
-        const dataOpenCitations = reponseOpenCitations.status === 200 ? (await reponseOpenCitations.json())[0] : null;
-        // load data from Crossref
-        const urlCrossref = `https://api.crossref.org/v1/works/${doi}?mailto=fabian.beck@uni-bamberg.de`
-        const reponseCrossref = await fetch(urlCrossref);
-        const dataCrossref = reponseCrossref.status === 200 ? await reponseCrossref.json() : null;
-        // merge data
-        data.title = dataCrossref?.message?.title?.[0] || dataOpenCitations?.title;
-        data.subtitle = dataCrossref?.message?.subtitle?.[0];
-        data.year = dataOpenCitations?.year || dataCrossref?.message?.created?.['date-parts']?.[0]?.[0] || doi.match(/\.((19|20)\d\d)\./)?.[1];
-        data.author = dataOpenCitations?.author;
-        data.container = dataOpenCitations?.source_title;
-        data.volume = dataOpenCitations?.volume;
-        data.issue = dataOpenCitations?.issue;
-        data.page = dataOpenCitations?.page;
-        data.oaLink = dataOpenCitations?.oa_link;
-        data.reference = dataOpenCitations?.reference;
-        data.citation = dataOpenCitations?.citation;
-        data.abstract = dataCrossref?.message?.abstract;
+        const dataOCReferences = reponseOCReferences.status === 200 ? (await reponseOCReferences.json()) : null;
+        dataOCReferences?.forEach(refernce => {
+            data.reference += refernce.cited + "; ";
+        });
+        data.citation = "";
+        const reponseOCCitations = await fetch(`https://opencitations.net/index/coci/api/v1/citations/${doi}`, {
+            headers: {
+                authorization: "aa9da96d-3c7b-49c1-a2d8-1c2d01ae10a5",
+            }
+        });
+        const dataOCCitations = reponseOCCitations.status === 200 ? (await reponseOCCitations.json()) : null;
+        dataOCCitations?.forEach(refernce => {
+            data.citation += refernce.citing + "; ";
+        });
+
         // remove undefined/empty properties from data
         Object.keys(data).forEach(key => (data[key] === undefined || data[key] === '') && delete data[key]);
         // store data in cache with expiration date
