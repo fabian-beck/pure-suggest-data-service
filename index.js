@@ -8,7 +8,7 @@ const admin = require('firebase-admin');
 admin.initializeApp();
 const firestore = admin.firestore();
 
-// Retrieve aggregated data from OpenCitations and CrossRef
+// Retrieve aggregated data from Crossref (or DataCite) and OpenCitations
 // deploy with: "gcloud functions deploy pure-publications --gen2 --runtime=nodejs18 --region=europe-west1 --source=. --entry-point=pure-publications --trigger-http --allow-unauthenticated"
 functions.http('pure-publications', async (req, res) => {
     const doi = req.query.doi;
@@ -39,15 +39,28 @@ functions.http('pure-publications', async (req, res) => {
         // load metadata from Crossref 
         const reponseCrossref = await fetch(`https://api.crossref.org/v1/works/${doi}?mailto=fabian.beck@uni-bamberg.de`);
         const dataCrossref = reponseCrossref.status === 200 ? (await reponseCrossref.json())?.message : null;
-        data.title = dataCrossref?.title?.[0];
+        // load metadata from DataCite (as additional source)
+        let dataDataCite = null;
+        if (!dataCrossref) {
+            const reponseDataCite = await fetch(`https://api.datacite.org/dois/${doi}`);
+            dataDataCite = reponseDataCite.status === 200 ? (await reponseDataCite.json())?.data : null;
+        }
+        // merge metadata from Crossref and Datacite
+        data.title = dataCrossref?.title?.[0]
+            || dataDataCite?.attributes?.titles?.[0]?.title;
         data.subtitle = dataCrossref?.subtitle?.[0];
-        data.year = dataCrossref?.created?.['date-parts']?.[0]?.[0] || doi.match(/\.((19|20)\d\d)\./)?.[1];
-        data.author = dataCrossref?.author?.reduce((acc, author) => acc + author.family + ", " + author.given + "; ", "").slice(0, -2);
-        data.container = dataCrossref?.["container-title"]?.[0];
+        data.year = dataCrossref?.created?.['date-parts']?.[0]?.[0]
+            || dataDataCite?.attributes?.publicationYear
+            || doi.match(/\.((19|20)\d\d)\./)?.[1];
+        data.author = dataCrossref?.author?.reduce((acc, author) => acc + author.family + ", " + author.given + "; ", "").slice(0, -2)
+            || dataDataCite?.attributes?.creators?.reduce((acc, author) => acc + author.name + "; ", "").slice(0, -2);
+        data.container = dataCrossref?.["container-title"]?.[0]
+            || dataDataCite?.attributes?.relatedItems?.[0]?.titles?.[0]?.title;
         data.volume = dataCrossref?.volume;
         data.issue = dataCrossref?.issue;
         data.page = dataCrossref?.page;
-        data.abstract = dataCrossref?.abstract;
+        data.abstract = dataCrossref?.abstract
+            || dataDataCite?.attributes?.descriptions?.[0]?.description;
 
         // load refernces/citations from OpenCitations
         data.reference = "";
@@ -76,7 +89,7 @@ functions.http('pure-publications', async (req, res) => {
         // store data in cache with expiration date
         const expireDate = new Date();
         expireDate.setDate(expireDate.getDate() + 30);
-        await doiRef.set({ expireAt: expireDate, data: data });
+        await doiRef.set({ expireAt: expireDate, data: data, source: dataDataCite ? "DataCite" : "Crossref" });
         // return data
         res.send(data);
     }
