@@ -11,11 +11,15 @@ const firestore = admin.firestore();
 // Retrieve aggregated data from Crossref (or DataCite) and OpenCitations
 // deploy with: "gcloud functions deploy pure-publications --gen2 --runtime=nodejs18 --region=europe-west1 --source=. --entry-point=pure-publications --trigger-http --allow-unauthenticated"
 functions.http('pure-publications', async (req, res) => {
+    const logEntry = { severity: "INFO" };
+
     const doi = req.query.doi;
     if (!doi) {
         res.status(400).send('Missing DOI parameter');
         return;
     }
+    logEntry.doi = doi;
+
     res.set('Content-Type', 'application/json');
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Methods', 'GET');
@@ -32,8 +36,11 @@ functions.http('pure-publications', async (req, res) => {
     const doiDoc = await doiRef.get();
     // return cached data if available and not expired
     if (doiDoc.exists && doiDoc.data().expireAt.toDate() > new Date()) {
+        logEntry.tag = "cache-hit";
         res.send(doiDoc.data().data);
     } else {
+        logEntry.tag = "cache-miss";
+
         const data = { doi: doi };
 
         // load metadata from Crossref 
@@ -93,4 +100,7 @@ functions.http('pure-publications', async (req, res) => {
         // return data
         res.send(data);
     }
+
+    // log request
+    console.log(JSON.stringify(logEntry));
 });
