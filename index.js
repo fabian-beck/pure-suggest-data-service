@@ -11,6 +11,7 @@ const firestore = admin.firestore();
 // Retrieve aggregated data from Crossref (or DataCite) and OpenCitations
 // deploy with: "gcloud functions deploy pure-publications --gen2 --runtime=nodejs18 --region=europe-west1 --source=. --entry-point=pure-publications --trigger-http --allow-unauthenticated"
 functions.http('pure-publications', async (req, res) => {
+    const timeStart = new Date().getTime();
     const logEntry = { severity: "INFO" };
 
     const doi = req.query.doi;
@@ -34,23 +35,26 @@ functions.http('pure-publications', async (req, res) => {
     const doi2 = doi.replace(/\//g, '\\');
     const doiRef = firestore.collection('pure-publications').doc(doi2);
     const doiDoc = await doiRef.get();
+    let data = { doi: doi };
     // return cached data if available and not expired
     if (doiDoc.exists && doiDoc.data().expireAt.toDate() > new Date()) {
         logEntry.tag = "cache-hit";
-        res.send(doiDoc.data().data);
+        data = doiDoc.data().data;
     } else {
         logEntry.tag = "cache-miss";
 
-        const data = { doi: doi };
-
         // load metadata from Crossref 
+        const timeStartCrossref = new Date().getTime();
         const reponseCrossref = await fetch(`https://api.crossref.org/v1/works/${doi}?mailto=fabian.beck@uni-bamberg.de`);
         const dataCrossref = reponseCrossref.status === 200 ? (await reponseCrossref.json())?.message : null;
+        logEntry.crossref = { status: reponseCrossref.status, processingTime: new Date().getTime() - timeStartCrossref };
         // load metadata from DataCite (as additional source)
         let dataDataCite = null;
         if (!dataCrossref) {
+            const timeStartDataCite = new Date().getTime();
             const reponseDataCite = await fetch(`https://api.datacite.org/dois/${doi}`);
             dataDataCite = reponseDataCite.status === 200 ? (await reponseDataCite.json())?.data : null;
+            logEntry.dataCite = { status: reponseDataCite.status, processingTime: new Date().getTime() - timeStartDataCite };
         }
         // merge metadata from Crossref and Datacite
         data.title = dataCrossref?.title?.[0]
@@ -70,6 +74,7 @@ functions.http('pure-publications', async (req, res) => {
             || dataDataCite?.attributes?.descriptions?.[0]?.description;
 
         // load refernces/citations from OpenCitations
+        const timeStartOpenCitations = new Date().getTime();
         data.reference = "";
         const reponseOCReferences = await fetch(`https://opencitations.net/index/coci/api/v1/references/${doi}`, {
             headers: {
@@ -90,6 +95,11 @@ functions.http('pure-publications', async (req, res) => {
         dataOCCitations?.forEach(refernce => {
             data.citation += refernce.citing + "; ";
         });
+        logEntry.openCitations = {
+            statusReferences: reponseOCReferences.status,
+            statusCitations: reponseOCCitations.status,
+            processingTime: new Date().getTime() - timeStartOpenCitations
+        };
 
         // remove undefined/empty properties from data
         Object.keys(data).forEach(key => (data[key] === undefined || data[key] === '') && delete data[key]);
@@ -97,10 +107,13 @@ functions.http('pure-publications', async (req, res) => {
         const expireDate = new Date();
         expireDate.setDate(expireDate.getDate() + 30);
         await doiRef.set({ expireAt: expireDate, data: data, source: dataDataCite ? "DataCite" : "Crossref" });
-        // return data
-        res.send(data);
     }
 
     // log request
+    logEntry.title = data.title;
+    logEntry.processingTime = new Date().getTime() - timeStart;
     console.log(JSON.stringify(logEntry));
+
+    // return data
+    res.send(data);
 });
