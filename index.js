@@ -72,19 +72,10 @@ functions.http('pure-publications', async (req, res) => {
         data.page = dataCrossref?.page;
         data.abstract = dataCrossref?.abstract
             || dataDataCite?.attributes?.descriptions?.[0]?.description;
+        data.reference = dataCrossref?.reference?.reduce((acc, reference) => acc + reference.DOI + "; ", "").slice(0, -2);
 
-        // load refernces/citations from OpenCitations
+        // load citations from OpenCitations
         const timeStartOpenCitations = new Date().getTime();
-        data.reference = "";
-        const reponseOCReferences = await fetch(`https://opencitations.net/index/coci/api/v1/references/${doi}`, {
-            headers: {
-                authorization: "aa9da96d-3c7b-49c1-a2d8-1c2d01ae10a5",
-            }
-        });
-        const dataOCReferences = reponseOCReferences.status === 200 ? (await reponseOCReferences.json()) : null;
-        dataOCReferences?.forEach(refernce => {
-            data.reference += refernce.cited + "; ";
-        });
         data.citation = "";
         const reponseOCCitations = await fetch(`https://opencitations.net/index/coci/api/v1/citations/${doi}`, {
             headers: {
@@ -96,7 +87,6 @@ functions.http('pure-publications', async (req, res) => {
             data.citation += refernce.citing + "; ";
         });
         logEntry.openCitations = {
-            statusReferences: reponseOCReferences.status,
             statusCitations: reponseOCCitations.status,
             processingTime: new Date().getTime() - timeStartOpenCitations
         };
