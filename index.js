@@ -72,7 +72,8 @@ functions.http('pure-publications', async (req, res) => {
         data.page = dataCrossref?.page;
         data.abstract = dataCrossref?.abstract
             || dataDataCite?.attributes?.descriptions?.[0]?.description;
-        data.reference = dataCrossref?.reference?.reduce((acc, reference) => acc + reference.DOI + "; ", "").slice(0, -2);
+        data.reference = dataCrossref?.reference?.reduce((acc, reference) =>
+            (reference.DOI ? acc + reference.DOI + "; " : acc), "").slice(0, -2);
 
         // load citations from OpenCitations
         const timeStartOpenCitations = new Date().getTime();
