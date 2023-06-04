@@ -14,7 +14,7 @@ functions.http('pure-publications', async (req, res) => {
     const timeStart = new Date().getTime();
     const logEntry = { severity: "INFO" };
 
-    const doi = req.query.doi;
+    const doi = req.query.doi.toLowerCase();
     if (!doi) {
         res.status(400).send('Missing DOI parameter');
         return;
