@@ -60,7 +60,7 @@ functions.http('pure-publications', async (req, res) => {
         data.title = dataCrossref?.title?.[0]
             || dataDataCite?.attributes?.titles?.[0]?.title;
         data.subtitle = dataCrossref?.subtitle?.[0];
-        data.year = dataCrossref?.created?.['date-parts']?.[0]?.[0]
+        data.year = dataCrossref?.published?.['date-parts']?.[0]?.[0]
             || dataDataCite?.attributes?.publicationYear
             || doi.match(/\.((19|20)\d\d)\./)?.[1];
         data.author = dataCrossref?.author?.reduce((acc, author) => acc + author.family + ", " + author.given + "; ", "").slice(0, -2)
