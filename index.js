@@ -63,7 +63,10 @@ functions.http('pure-publications', async (req, res) => {
         data.year = dataCrossref?.published?.['date-parts']?.[0]?.[0]
             || dataDataCite?.attributes?.publicationYear
             || doi.match(/\.((19|20)\d\d)\./)?.[1];
-        data.author = dataCrossref?.author?.reduce((acc, author) => acc + author.family + ", " + author.given + "; ", "").slice(0, -2)
+        data.author = dataCrossref?.author?.reduce((acc, author) => acc + author.family
+            + (author.given ? ", " + author.given : "")
+            + (author.ORCID ? ", " + author.ORCID.replace(/http(s?):\/\/orcid.org\//g, "") : "")
+            + "; ", "").slice(0, -2)
             || dataDataCite?.attributes?.creators?.reduce((acc, author) => acc + author.name + "; ", "").slice(0, -2);
         data.container = dataCrossref?.["container-title"]?.[0]
             || dataDataCite?.attributes?.relatedItems?.[0]?.titles?.[0]?.title;
