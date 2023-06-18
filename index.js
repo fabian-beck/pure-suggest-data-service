@@ -69,6 +69,7 @@ functions.http('pure-publications', async (req, res) => {
             + (author.ORCID ? ", " + author.ORCID.replace(/http(s?):\/\/orcid.org\//g, "") : "")
             + "; ", "").slice(0, -2)
             || dataDataCite?.attributes?.creators?.reduce((acc, author) => acc + author.name + "; ", "").slice(0, -2);
+        data.author = data.author.replace(/(\w)(\w+)(\W?)/g, (match, p1, p2, p3) => p1 + p2.toLowerCase() + p3); // auto-correct ALLCAPS author names
         data.container = dataCrossref?.["container-title"]?.[0]
             || dataDataCite?.attributes?.relatedItems?.[0]?.titles?.[0]?.title;
         data.volume = dataCrossref?.volume;
