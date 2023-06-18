@@ -101,7 +101,7 @@ functions.http('pure-publications', async (req, res) => {
         Object.keys(data).forEach(key => (data[key] === undefined || data[key] === '') && delete data[key]);
         // store data in cache with expiration date
         const expireDate = new Date();
-        expireDate.setDate(expireDate.getDate() + 30);
+        expireDate.setDate(expireDate.getDate() + reponseCrossref.status === 200 ? 30 : 1);
         await doiRef.set({ expireAt: expireDate, data: data, source: dataDataCite ? "DataCite" : "Crossref" });
     }
 
