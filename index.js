@@ -15,6 +15,7 @@ functions.http('pure-publications', async (req, res) => {
     const logEntry = { severity: "INFO" };
 
     const doi = req.query.doi.toLowerCase();
+    const noCache = req.query.noCache === "true";
     if (!doi) {
         res.status(400).send('Missing DOI parameter');
         return;
@@ -37,11 +38,11 @@ functions.http('pure-publications', async (req, res) => {
     const doiDoc = await doiRef.get();
     let data = { doi: doi };
     // return cached data if available and not expired
-    if (doiDoc.exists && doiDoc.data().expireAt.toDate() > new Date()) {
+    if (!noCache && doiDoc.exists && doiDoc.data().expireAt.toDate() > new Date()) {
         logEntry.tag = "cache-hit";
         data = doiDoc.data().data;
     } else {
-        logEntry.tag = "cache-miss";
+        logEntry.tag = noCache ? "cache-disabled" : "cache-miss";
 
         // load metadata from Crossref 
         const timeStartCrossref = new Date().getTime();
