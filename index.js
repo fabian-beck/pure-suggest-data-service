@@ -58,27 +58,32 @@ functions.http('pure-publications', async (req, res) => {
             logEntry.dataCite = { status: reponseDataCite.status, processingTime: new Date().getTime() - timeStartDataCite };
         }
         // merge metadata from Crossref and Datacite
-        data.title = dataCrossref?.title?.[0]
-            || dataDataCite?.attributes?.titles?.[0]?.title;
-        data.subtitle = dataCrossref?.subtitle?.[0];
-        data.year = dataCrossref?.published?.['date-parts']?.[0]?.[0]
-            || dataDataCite?.attributes?.publicationYear
-            || doi.match(/\.((19|20)\d\d)\./)?.[1];
-        data.author = dataCrossref?.author?.reduce((acc, author) => acc + author.family
-            + (author.given ? ", " + author.given : "")
-            + (author.ORCID ? ", " + author.ORCID.replace(/http(s?):\/\/orcid.org\//g, "") : "")
-            + "; ", "").slice(0, -2)
-            || dataDataCite?.attributes?.creators?.reduce((acc, author) => acc + author.name + "; ", "").slice(0, -2);
-        data.author = data.author.replace(/(\w)(\w+)(\W?)/g, (match, p1, p2, p3) => p1 + p2.toLowerCase() + p3); // auto-correct ALLCAPS author names
-        data.container = dataCrossref?.["container-title"]?.[0]
-            || dataDataCite?.attributes?.relatedItems?.[0]?.titles?.[0]?.title;
-        data.volume = dataCrossref?.volume;
-        data.issue = dataCrossref?.issue;
-        data.page = dataCrossref?.page;
-        data.abstract = dataCrossref?.abstract
-            || dataDataCite?.attributes?.descriptions?.[0]?.description;
-        data.reference = dataCrossref?.reference?.reduce((acc, reference) =>
-            (reference.DOI ? acc + reference.DOI + "; " : acc), "").slice(0, -2);
+        try {
+            data.title = dataCrossref?.title?.[0]
+                || dataDataCite?.attributes?.titles?.[0]?.title;
+            data.subtitle = dataCrossref?.subtitle?.[0];
+            data.year = dataCrossref?.published?.['date-parts']?.[0]?.[0]
+                || dataDataCite?.attributes?.publicationYear
+                || doi.match(/\.((19|20)\d\d)\./)?.[1];
+            data.author = dataCrossref?.author?.reduce((acc, author) => acc + author.family
+                + (author.given ? ", " + author.given : "")
+                + (author.ORCID ? ", " + author.ORCID.replace(/http(s?):\/\/orcid.org\//g, "") : "")
+                + "; ", "").slice(0, -2)
+                || dataDataCite?.attributes?.creators?.reduce((acc, author) => acc + author.name + "; ", "").slice(0, -2);
+            data.author = data.author?.replace(/(\w)(\w+)(\W?)/g, (match, p1, p2, p3) => p1 + p2.toLowerCase() + p3); // auto-correct ALLCAPS author names
+            data.container = dataCrossref?.["container-title"]?.[0]
+                || dataDataCite?.attributes?.relatedItems?.[0]?.titles?.[0]?.title;
+            data.volume = dataCrossref?.volume;
+            data.issue = dataCrossref?.issue;
+            data.page = dataCrossref?.page;
+            data.abstract = dataCrossref?.abstract
+                || dataDataCite?.attributes?.descriptions?.[0]?.description;
+            data.reference = dataCrossref?.reference?.reduce((acc, reference) =>
+                (reference.DOI ? acc + reference.DOI + "; " : acc), "").slice(0, -2);
+        } catch (error) {
+            console.error("Error processing metadata: " + error + "\n" + JSON.stringify(dataCrossref) + "\n" + JSON.stringify(dataDataCite) + "\n" + JSON.stringify(logEntry));
+            res.send({ error: "Error processing metadata: " + error });
+        }
 
         // load citations from OpenCitations
         const timeStartOpenCitations = new Date().getTime();
