@@ -86,21 +86,26 @@ functions.http('pure-publications', async (req, res) => {
         }
 
         // load citations from OpenCitations
-        const timeStartOpenCitations = new Date().getTime();
-        data.citation = "";
-        const reponseOCCitations = await fetch(`https://opencitations.net/index/coci/api/v1/citations/${doi}`, {
-            headers: {
-                authorization: "aa9da96d-3c7b-49c1-a2d8-1c2d01ae10a5",
-            }
-        });
-        const dataOCCitations = reponseOCCitations.status === 200 ? (await reponseOCCitations.json()) : null;
-        dataOCCitations?.forEach(refernce => {
-            data.citation += refernce.citing + "; ";
-        });
-        logEntry.openCitations = {
-            statusCitations: reponseOCCitations.status,
-            processingTime: new Date().getTime() - timeStartOpenCitations
-        };
+        // if not too many citations (is-referenced-by-count)
+        if (!dataCrossref || dataCrossref["is-referenced-by-count"] < 1000) {
+            const timeStartOpenCitations = new Date().getTime();
+            data.citation = "";
+            const reponseOCCitations = await fetch(`https://opencitations.net/index/coci/api/v1/citations/${doi}`, {
+                headers: {
+                    authorization: "aa9da96d-3c7b-49c1-a2d8-1c2d01ae10a5",
+                }
+            });
+            const dataOCCitations = reponseOCCitations.status === 200 ? (await reponseOCCitations.json()) : null;
+            dataOCCitations?.forEach(refernce => {
+                data.citation += refernce.citing + "; ";
+            });
+            logEntry.openCitations = {
+                statusCitations: reponseOCCitations.status,
+                processingTime: new Date().getTime() - timeStartOpenCitations
+            };
+        } else {
+            data.tooManyCitations = true;
+        }
 
         // remove undefined/empty properties from data
         Object.keys(data).forEach(key => (data[key] === undefined || data[key] === '') && delete data[key]);
