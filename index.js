@@ -9,7 +9,7 @@ admin.initializeApp();
 const firestore = admin.firestore();
 
 // Retrieve aggregated data from Crossref (or DataCite) and OpenCitations
-// deploy with: "gcloud functions deploy pure-publications --gen2 --runtime=nodejs18 --region=europe-west1 --source=. --entry-point=pure-publications --trigger-http --allow-unauthenticated"
+// deploy with: "gcloud functions deploy pure-publications --gen2 --runtime=nodejs20 --region=europe-west1 --source=. --entry-point=pure-publications --trigger-http --allow-unauthenticated"
 functions.http('pure-publications', async (req, res) => {
     const timeStart = new Date().getTime();
     const logEntry = { severity: "INFO" };
