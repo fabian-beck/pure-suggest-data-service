@@ -90,14 +90,18 @@ functions.http('pure-publications', async (req, res) => {
         if (!dataCrossref || dataCrossref["is-referenced-by-count"] < 1000) {
             const timeStartOpenCitations = new Date().getTime();
             data.citation = "";
-            const reponseOCCitations = await fetch(`https://opencitations.net/index/coci/api/v1/citations/${doi}`, {
+            const reponseOCCitations = await fetch(`https://opencitations.net/index/api/v2/citations/doi:${doi}`, {
                 headers: {
                     authorization: "aa9da96d-3c7b-49c1-a2d8-1c2d01ae10a5",
                 }
             });
             const dataOCCitations = reponseOCCitations.status === 200 ? (await reponseOCCitations.json()) : null;
-            dataOCCitations?.forEach(refernce => {
-                data.citation += refernce.citing + "; ";
+            dataOCCitations?.forEach(reference => {
+                // extract doi from citing
+                const doi = reference.citing.match(/doi:(\S*)\s/i)?.[1];
+                if (doi) {
+                    data.citation += doi + "; ";
+                }
             });
             logEntry.openCitations = {
                 statusCitations: reponseOCCitations.status,
