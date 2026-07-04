@@ -98,7 +98,7 @@ functions.http('pure-publications', async (req, res) => {
             const dataOCCitations = reponseOCCitations.status === 200 ? (await reponseOCCitations.json()) : null;
             dataOCCitations?.forEach(reference => {
                 // extract doi from citing
-                const doi = reference.citing.match(/doi:(\S*)\s/i)?.[1];
+                const doi = reference.citing.match(/doi:(\S*)\s?/i)?.[1];
                 if (doi) {
                     data.citation += doi + "; ";
                 }
@@ -115,7 +115,7 @@ functions.http('pure-publications', async (req, res) => {
         Object.keys(data).forEach(key => (data[key] === undefined || data[key] === '') && delete data[key]);
         // store data in cache with expiration date
         const expireDate = new Date();
-        expireDate.setDate(expireDate.getDate() + reponseCrossref.status === 200 ? 30 : 1);
+        expireDate.setDate(expireDate.getDate() + (reponseCrossref.status === 200 ? 30 : 1));
         await doiRef.set({ expireAt: expireDate, data: data, source: dataDataCite ? "DataCite" : "Crossref" });
     }
 
