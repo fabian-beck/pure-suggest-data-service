@@ -36,14 +36,20 @@ functions.http('pure-publications', async (req, res) => {
     const doi2 = doi.replace(/\//g, '\\');
     const doiRef = firestore.collection('pure-publications').doc(doi2);
     const doiDoc = await doiRef.get();
+    const cachedEntry = doiDoc.exists ? doiDoc.data() : null;
+    const cachedData = cachedEntry?.data;
+    const cachedExpireAt = cachedEntry?.expireAt?.toDate?.();
+    const hasMetadata = entry => Boolean(entry?.title || entry?.author || entry?.year || entry?.container || entry?.abstract);
     let data = { doi: doi };
     // return cached data if available and not expired
-    if (!noCache && doiDoc.exists && doiDoc.data().expireAt.toDate() > new Date()) {
+    if (!noCache && cachedExpireAt > new Date()) {
         logEntry.tag = "cache-hit";
-        data = doiDoc.data().data;
+        data = cachedData;
     } else {
-        logEntry.tag = noCache ? "cache-disabled" : "cache-miss";
-
+        logEntry.tag = noCache ? "cache-disabled" : (cachedEntry ? "cache-expired" : "cache-miss");
+        if (cachedExpireAt) {
+            logEntry.cacheExpireAt = cachedExpireAt.toISOString();
+        }
         // load metadata from Crossref 
         const timeStartCrossref = new Date().getTime();
         const reponseCrossref = await fetch(`https://api.crossref.org/v1/works/${doi}?mailto=fabian.beck@uni-bamberg.de`);
@@ -113,10 +119,18 @@ functions.http('pure-publications', async (req, res) => {
 
         // remove undefined/empty properties from data
         Object.keys(data).forEach(key => (data[key] === undefined || data[key] === '') && delete data[key]);
-        // store data in cache with expiration date
-        const expireDate = new Date();
-        expireDate.setDate(expireDate.getDate() + (reponseCrossref.status === 200 ? 30 : 1));
-        await doiRef.set({ expireAt: expireDate, data: data, source: dataDataCite ? "DataCite" : "Crossref" });
+        if (!noCache && !hasMetadata(data) && hasMetadata(cachedData)) {
+            logEntry.tag = "cache-stale";
+            data = cachedData;
+            const expireDate = new Date();
+            expireDate.setMinutes(expireDate.getMinutes() + 15);
+            await doiRef.set({ expireAt: expireDate, data: data, source: cachedEntry.source || "stale" });
+        } else {
+            // store data in cache with expiration date
+            const expireDate = new Date();
+            expireDate.setDate(expireDate.getDate() + (reponseCrossref.status === 200 ? 30 : 1));
+            await doiRef.set({ expireAt: expireDate, data: data, source: dataDataCite ? "DataCite" : "Crossref" });
+        }
     }
 
     // log request
