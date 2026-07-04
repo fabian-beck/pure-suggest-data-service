@@ -10,6 +10,10 @@ const firestore = admin.firestore();
 
 const CROSSREF_BACKOFF_MS = 5 * 60 * 1000;
 const CROSSREF_USER_AGENT = "pure-suggest-data-service/0.0.1 (mailto:fabian.beck@uni-bamberg.de)";
+const CLOUD_REGION = "europe-west1";
+const PROJECT_ID = process.env.GCP_PROJECT || process.env.GCLOUD_PROJECT || "pure-suggest-data-service";
+const REFRESH_QUEUE = "pure-publications-refresh";
+const FUNCTION_URL = `https://${CLOUD_REGION}-${PROJECT_ID}.cloudfunctions.net/pure-publications`;
 
 const isTransientCrossrefStatus = status => status === 429 || (status >= 500 && status < 600) || status === "backoff" || status === "error";
 const hasMetadata = entry => Boolean(entry?.title || entry?.author || entry?.container || entry?.abstract);
@@ -193,6 +197,54 @@ const refreshPublicationData = async ({ doi, doiRef, cachedEntry, noCache, logEn
     return data;
 };
 
+const getMetadataAccessToken = async () => {
+    const response = await fetch("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", {
+        headers: {
+            "Metadata-Flavor": "Google",
+        }
+    });
+    if (!response.ok) {
+        throw new Error(`Metadata token request failed with ${response.status}`);
+    }
+    return (await response.json()).access_token;
+};
+
+const enqueueRefreshTask = async ({ doi, doiRef, cachedEntry, logEntry }) => {
+    const refreshQueuedAt = cachedEntry?.refreshQueuedAt?.toDate?.();
+    if (refreshQueuedAt && refreshQueuedAt > new Date(Date.now() - 60 * 1000)) {
+        logEntry.refresh = "already-queued";
+        logEntry.refreshQueuedAt = refreshQueuedAt.toISOString();
+        return;
+    }
+
+    const accessToken = await getMetadataAccessToken();
+    const tasksUrl = `https://cloudtasks.googleapis.com/v2/projects/${PROJECT_ID}/locations/${CLOUD_REGION}/queues/${REFRESH_QUEUE}/tasks`;
+    const refreshUrl = `${FUNCTION_URL}?doi=${encodeURIComponent(doi)}&refreshCache=true`;
+    const response = await fetch(tasksUrl, {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+            task: {
+                httpRequest: {
+                    httpMethod: "GET",
+                    url: refreshUrl,
+                }
+            }
+        })
+    });
+
+    if (!response.ok) {
+        throw new Error(`Cloud Tasks enqueue failed with ${response.status}: ${await response.text()}`);
+    }
+
+    const task = await response.json();
+    await doiRef.set({ refreshQueuedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    logEntry.refresh = "queued";
+    logEntry.refreshTask = task.name;
+};
 const logRequest = (logEntry, data, timeStart) => {
     logEntry.title = data?.title;
     logEntry.processingTime = new Date().getTime() - timeStart;
@@ -221,7 +273,9 @@ functions.http('pure-publications', async (req, res) => {
     }
 
     const doi = req.query.doi.toLowerCase();
+    const refreshCache = req.query.refreshCache === "true";
     const noCache = req.query.noCache === "true";
+    const bypassCache = noCache || refreshCache;
     logEntry.doi = doi;
 
     // Convert forward to backward slashes in doi
@@ -232,43 +286,30 @@ functions.http('pure-publications', async (req, res) => {
     const cachedData = cachedEntry?.data;
     const cachedExpireAt = cachedEntry?.expireAt?.toDate?.();
 
-    if (!noCache && cachedExpireAt > new Date()) {
+    if (!bypassCache && cachedExpireAt > new Date()) {
         logEntry.tag = "cache-hit";
         logRequest(logEntry, cachedData, timeStart);
         res.send(cachedData);
         return;
     }
 
-    if (!noCache && hasMetadata(cachedData)) {
+    if (!bypassCache && hasMetadata(cachedData)) {
         logEntry.tag = "cache-stale";
         if (cachedExpireAt) {
             logEntry.cacheExpireAt = cachedExpireAt.toISOString();
         }
-        logEntry.refresh = "started";
+        try {
+            await enqueueRefreshTask({ doi, doiRef, cachedEntry, logEntry });
+        } catch (error) {
+            logEntry.refresh = "enqueue-error";
+            logEntry.refreshError = String(error).slice(0, 500);
+        }
         logRequest(logEntry, cachedData, timeStart);
         res.send(cachedData);
-
-        const refreshLogEntry = {
-            severity: "INFO",
-            doi: doi,
-            tag: "cache-refresh"
-        };
-        if (cachedExpireAt) {
-            refreshLogEntry.cacheExpireAt = cachedExpireAt.toISOString();
-        }
-        const refreshStart = new Date().getTime();
-        try {
-            const refreshedData = await refreshPublicationData({ doi, doiRef, cachedEntry, noCache, logEntry: refreshLogEntry });
-            logRequest(refreshLogEntry, refreshedData, refreshStart);
-        } catch (error) {
-            refreshLogEntry.severity = "ERROR";
-            refreshLogEntry.error = String(error);
-            logRequest(refreshLogEntry, cachedData, refreshStart);
-        }
         return;
     }
 
-    logEntry.tag = noCache ? "cache-disabled" : (cachedEntry ? "cache-expired" : "cache-miss");
+    logEntry.tag = refreshCache ? "cache-refresh" : (noCache ? "cache-disabled" : (cachedEntry ? "cache-expired" : "cache-miss"));
     if (cachedExpireAt) {
         logEntry.cacheExpireAt = cachedExpireAt.toISOString();
     }
