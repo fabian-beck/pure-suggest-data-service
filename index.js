@@ -10,6 +10,8 @@ const firestore = admin.firestore();
 
 const CROSSREF_BACKOFF_MS = 5 * 60 * 1000;
 const CROSSREF_USER_AGENT = "pure-suggest-data-service/0.0.1 (mailto:fabian.beck@uni-bamberg.de)";
+const OPENCITATIONS_ACCESS_TOKEN = "aa9da96d-3c7b-49c1-a2d8-1c2d01ae10a5";
+const OPENALEX_API_KEY = process.env.OPENALEX_API_KEY;
 const CLOUD_REGION = "europe-west1";
 const PROJECT_ID = process.env.GCP_PROJECT || process.env.GCLOUD_PROJECT || "pure-suggest-data-service";
 const REFRESH_QUEUE = "pure-publications-refresh";
@@ -107,26 +109,124 @@ const fetchDataCite = async (doi, logEntry) => {
     return dataDataCite;
 };
 
-const mergeMetadata = (doi, dataCrossref, dataDataCite) => {
+const fetchOpenCitationsMeta = async (doi, logEntry) => {
+    const timeStartOpenCitationsMeta = new Date().getTime();
+    try {
+        const responseOpenCitationsMeta = await fetch(`https://api.opencitations.net/meta/v1/metadata/doi:${doi}`, {
+            headers: {
+                authorization: OPENCITATIONS_ACCESS_TOKEN,
+            }
+        });
+        const dataOpenCitationsMeta = responseOpenCitationsMeta.status === 200 ? (await responseOpenCitationsMeta.json())?.[0] : null;
+        logEntry.openCitationsMeta = { status: responseOpenCitationsMeta.status, processingTime: new Date().getTime() - timeStartOpenCitationsMeta };
+        return dataOpenCitationsMeta;
+    } catch (error) {
+        logEntry.openCitationsMeta = {
+            status: "error",
+            error: String(error).slice(0, 500),
+            processingTime: new Date().getTime() - timeStartOpenCitationsMeta
+        };
+        return null;
+    }
+};
+
+const fetchOpenAlex = async (doi, logEntry) => {
+    if (!OPENALEX_API_KEY) {
+        logEntry.openAlex = { status: "skipped", reason: "missing-api-key" };
+        return null;
+    }
+
+    const timeStartOpenAlex = new Date().getTime();
+    try {
+        const responseOpenAlex = await fetch(`https://api.openalex.org/works/${encodeURIComponent(`doi:${doi}`)}?api_key=${encodeURIComponent(OPENALEX_API_KEY)}`);
+        const dataOpenAlex = responseOpenAlex.status === 200 ? (await responseOpenAlex.json()) : null;
+        logEntry.openAlex = { status: responseOpenAlex.status, processingTime: new Date().getTime() - timeStartOpenAlex };
+        return dataOpenAlex;
+    } catch (error) {
+        logEntry.openAlex = {
+            status: "error",
+            error: String(error).slice(0, 500),
+            processingTime: new Date().getTime() - timeStartOpenAlex
+        };
+        return null;
+    }
+};
+
+const cleanOpenCitationsAuthor = author => author?.split("; ").map(authorEntry => {
+    const orcid = authorEntry.match(/\[.*?orcid:([^\s\]]+)/)?.[1];
+    const name = authorEntry.replace(/\s*\[[^\]]*\]/g, "");
+    return name + (orcid ? ", " + orcid : "");
+}).join("; ");
+
+const cleanOpenCitationsVenue = venue => venue?.replace(/\s*\[[^\]]*\]\s*$/g, "");
+
+const getOpenAlexPage = biblio => {
+    if (!biblio?.first_page) {
+        return biblio?.last_page;
+    }
+    return biblio.last_page && biblio.last_page !== biblio.first_page
+        ? `${biblio.first_page}-${biblio.last_page}`
+        : biblio.first_page;
+};
+
+const getOpenAlexAuthors = work => work?.authorships?.map(authorship => {
+    const author = authorship.author;
+    if (!author?.display_name) {
+        return null;
+    }
+    return author.display_name + (author.orcid ? ", " + author.orcid.replace(/http(s?):\/\/orcid.org\//g, "") : "");
+}).filter(Boolean).join("; ");
+
+const getOpenAlexAbstract = work => {
+    const invertedIndex = work?.abstract_inverted_index;
+    if (!invertedIndex) {
+        return undefined;
+    }
+
+    return Object.entries(invertedIndex).reduce((words, [word, positions]) => {
+        positions.forEach(position => {
+            words[position] = word;
+        });
+        return words;
+    }, []).join(" ");
+};
+
+const mergeMetadata = (doi, dataCrossref, dataDataCite, dataOpenCitationsMeta, dataOpenAlex) => {
     const data = { doi: doi };
     data.title = dataCrossref?.title?.[0]
+        || dataOpenCitationsMeta?.title
+        || dataOpenAlex?.title
+        || dataOpenAlex?.display_name
         || dataDataCite?.attributes?.titles?.[0]?.title;
     data.subtitle = dataCrossref?.subtitle?.[0];
     data.year = dataCrossref?.published?.['date-parts']?.[0]?.[0]
+        || dataOpenCitationsMeta?.pub_date?.match(/^(\d{4})/)?.[1]
+        || dataOpenAlex?.publication_year
         || dataDataCite?.attributes?.publicationYear
         || doi.match(/\.((19|20)\d\d)\./)?.[1];
     data.author = dataCrossref?.author?.reduce((acc, author) => acc + author.family
         + (author.given ? ", " + author.given : "")
         + (author.ORCID ? ", " + author.ORCID.replace(/http(s?):\/\/orcid.org\//g, "") : "")
         + "; ", "").slice(0, -2)
+        || cleanOpenCitationsAuthor(dataOpenCitationsMeta?.author)
+        || getOpenAlexAuthors(dataOpenAlex)
         || dataDataCite?.attributes?.creators?.reduce((acc, author) => acc + author.name + "; ", "").slice(0, -2);
     data.author = data.author?.replace(/(\w)(\w+)(\W?)/g, (match, p1, p2, p3) => p1 + p2.toLowerCase() + p3); // auto-correct ALLCAPS author names
     data.container = dataCrossref?.["container-title"]?.[0]
+        || cleanOpenCitationsVenue(dataOpenCitationsMeta?.venue)
+        || dataOpenAlex?.primary_location?.source?.display_name
         || dataDataCite?.attributes?.relatedItems?.[0]?.titles?.[0]?.title;
-    data.volume = dataCrossref?.volume;
-    data.issue = dataCrossref?.issue;
-    data.page = dataCrossref?.page;
+    data.volume = dataCrossref?.volume
+        || dataOpenCitationsMeta?.volume
+        || dataOpenAlex?.biblio?.volume;
+    data.issue = dataCrossref?.issue
+        || dataOpenCitationsMeta?.issue
+        || dataOpenAlex?.biblio?.issue;
+    data.page = dataCrossref?.page
+        || dataOpenCitationsMeta?.page
+        || getOpenAlexPage(dataOpenAlex?.biblio);
     data.abstract = dataCrossref?.abstract
+        || getOpenAlexAbstract(dataOpenAlex)
         || dataDataCite?.attributes?.descriptions?.[0]?.description;
     data.reference = dataCrossref?.reference?.reduce((acc, reference) =>
         (reference.DOI ? acc + reference.DOI + "; " : acc), "").slice(0, -2);
@@ -140,7 +240,7 @@ const addOpenCitations = async (doi, data, dataCrossref, logEntry) => {
         data.citation = "";
         const responseOCCitations = await fetch(`https://opencitations.net/index/api/v2/citations/doi:${doi}`, {
             headers: {
-                authorization: "aa9da96d-3c7b-49c1-a2d8-1c2d01ae10a5",
+                authorization: OPENCITATIONS_ACCESS_TOKEN,
             }
         });
         const dataOCCitations = responseOCCitations.status === 200 ? (await responseOCCitations.json()) : null;
@@ -164,17 +264,32 @@ const refreshPublicationData = async ({ doi, doiRef, cachedEntry, noCache, logEn
     const cachedData = cachedEntry?.data;
     const crossref = await fetchCrossref(doi, logEntry);
     const dataCrossref = crossref.data;
+    let dataOpenCitationsMeta = null;
+    let dataOpenAlex = null;
     let dataDataCite = null;
 
     if (!dataCrossref) {
+        dataOpenCitationsMeta = await fetchOpenCitationsMeta(doi, logEntry);
+    }
+    if (!dataCrossref && !hasMetadata(dataOpenCitationsMeta)) {
+        dataOpenAlex = await fetchOpenAlex(doi, logEntry);
+    }
+    if (!dataCrossref && !hasMetadata(dataOpenCitationsMeta) && !hasMetadata(dataOpenAlex)) {
         dataDataCite = await fetchDataCite(doi, logEntry);
     }
 
+    const metadataSource = dataCrossref ? "Crossref"
+        : hasMetadata(dataOpenCitationsMeta) ? "OpenCitations Meta"
+            : hasMetadata(dataOpenAlex) ? "OpenAlex"
+                : dataDataCite ? "DataCite" : "none";
+
+    logEntry.metadataSource = metadataSource;
+
     let data;
     try {
-        data = mergeMetadata(doi, dataCrossref, dataDataCite);
+        data = mergeMetadata(doi, dataCrossref, dataDataCite, dataOpenCitationsMeta, dataOpenAlex);
     } catch (error) {
-        console.error("Error processing metadata: " + error + "\n" + JSON.stringify(dataCrossref) + "\n" + JSON.stringify(dataDataCite) + "\n" + JSON.stringify(logEntry));
+        console.error("Error processing metadata: " + error + "\n" + JSON.stringify(dataCrossref) + "\n" + JSON.stringify(dataOpenCitationsMeta) + "\n" + JSON.stringify(dataOpenAlex) + "\n" + JSON.stringify(dataDataCite) + "\n" + JSON.stringify(logEntry));
         return { error: "Error processing metadata: " + error };
     }
 
@@ -191,7 +306,7 @@ const refreshPublicationData = async ({ doi, doiRef, cachedEntry, noCache, logEn
         logEntry.cacheWrite = "skipped-transient-crossref-failure";
     } else {
         logEntry.cacheWrite = "stored";
-        await doiRef.set({ expireAt: getCacheExpireDate(crossref.status), data: data, source: dataDataCite ? "DataCite" : "Crossref" });
+        await doiRef.set({ expireAt: getCacheExpireDate(hasMetadata(data) ? 200 : crossref.status), data: data, source: metadataSource });
     }
 
     return data;
