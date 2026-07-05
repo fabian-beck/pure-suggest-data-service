@@ -698,6 +698,36 @@ const logRequest = (logEntry, data, timeStart) => {
     console.log(JSON.stringify(logEntry));
 };
 
+const getRequestLogContext = req => {
+    const context = {
+        method: req.method,
+        requestUrl: req.originalUrl || req.url,
+        refreshCache: isTruthyFlag(req.query.refreshCache) || isTruthyFlag(req.body?.refreshCache) || undefined,
+        noCache: isTruthyFlag(req.query.noCache) || isTruthyFlag(req.body?.noCache) || undefined,
+        prefetch: isTruthyFlag(req.query.prefetch) || isTruthyFlag(req.body?.prefetch) || undefined
+    };
+
+    try {
+        const { dois, isBulk } = getDoiRequestInput(req);
+        context.doiCount = dois.length;
+        context.doi = dois.length === 1 ? dois[0] : undefined;
+        context.isBulk = isBulk || undefined;
+    } catch (error) {
+        context.requestInputError = String(error).slice(0, 500);
+    }
+
+    return context;
+};
+
+const logUnhandledRequestError = (req, error, timeStart) => console.error(JSON.stringify({
+    severity: "ERROR",
+    tag: "unhandled-request-error",
+    ...getRequestLogContext(req),
+    error: String(error).slice(0, 1000),
+    stack: error?.stack?.slice(0, 2000),
+    processingTime: new Date().getTime() - timeStart
+}));
+
 // Retrieve aggregated data from Crossref (or DataCite) and OpenCitations
 // deploy with: "gcloud functions deploy pure-publications --gen2 --runtime=nodejs24 --region=europe-west1 --source=. --entry-point=pure-publications --trigger-http --allow-unauthenticated"
 functions.http('pure-publications', async (req, res) => {
@@ -707,6 +737,8 @@ functions.http('pure-publications', async (req, res) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Methods', 'GET, POST');
     res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    try {
 
     if (req.method === "OPTIONS") {
         // stop preflight requests here
@@ -788,4 +820,10 @@ functions.http('pure-publications', async (req, res) => {
     }
     logRequest(result.logEntry, result.data, result.timeStart);
     res.send(result.data);
+    } catch (error) {
+        logUnhandledRequestError(req, error, timeStart);
+        if (!res.headersSent) {
+            res.status(500).send({ error: "Internal server error" });
+        }
+    }
 });
