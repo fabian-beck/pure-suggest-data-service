@@ -10,6 +10,7 @@ const {
     getPrefetchTargetsByRelation,
     hasMetadata,
     isTransientCrossrefStatus,
+    loadBulkPublicationData,
     mergeMetadata,
     normalizeDoi,
     parseDoiInput,
@@ -58,6 +59,84 @@ test('extracts DOI request input from query and post body shapes', () => {
         ],
         isBulk: true
     });
+});
+
+test('bulk publication loading starts DOI loads concurrently and preserves response order', async () => {
+    const dois = ['10.a/one', '10.b/two', '10.c/three'];
+    const pending = new Map();
+    const started = [];
+    const logged = [];
+
+    const bulkPromise = loadBulkPublicationData({
+        dois,
+        refreshCache: false,
+        noCache: false,
+        prefetch: false,
+        collectPrefetchSignals: false,
+        prefetchContext: { signalCount: 0, enqueueAttemptCount: 0 },
+        dependencies: {
+            loadPublicationData: async ({ doi, collectPrefetchSignals }) => {
+                started.push(doi);
+                assert.equal(collectPrefetchSignals, false);
+                return new Promise(resolve => pending.set(doi, () => resolve({
+                    data: { doi },
+                    logEntry: { doi },
+                    timeStart: Date.now()
+                })));
+            },
+            logRequest: (logEntry, data) => logged.push(data.doi)
+        }
+    });
+
+    assert.deepEqual(started, dois);
+
+    pending.get('10.c/three')();
+    pending.get('10.a/one')();
+    pending.get('10.b/two')();
+
+    const results = await bulkPromise;
+
+    assert.deepEqual(results, dois.map(doi => ({ doi })));
+    assert.deepEqual([...logged].sort(), [...dois].sort());
+});
+
+test('bulk publication loading serializes prefetch signal bookkeeping', async () => {
+    const prefetchContext = { signalCount: 0, enqueueAttemptCount: 0 };
+    const dois = ['10.a/one', '10.b/two'];
+    const recorded = [];
+    let activeRecorders = 0;
+    let maxActiveRecorders = 0;
+
+    await loadBulkPublicationData({
+        dois,
+        refreshCache: false,
+        noCache: false,
+        prefetch: false,
+        collectPrefetchSignals: true,
+        prefetchContext,
+        dependencies: {
+            loadPublicationData: async ({ doi, collectPrefetchSignals }) => {
+                assert.equal(collectPrefetchSignals, false);
+                return {
+                    data: { doi },
+                    logEntry: { doi },
+                    timeStart: Date.now()
+                };
+            },
+            recordPrefetchSignals: async ({ sourceDoi, context }) => {
+                assert.equal(context, prefetchContext);
+                activeRecorders++;
+                maxActiveRecorders = Math.max(maxActiveRecorders, activeRecorders);
+                recorded.push(sourceDoi);
+                await new Promise(resolve => setImmediate(resolve));
+                activeRecorders--;
+            },
+            logRequest: () => {}
+        }
+    });
+
+    assert.equal(maxActiveRecorders, 1);
+    assert.deepEqual(recorded, dois);
 });
 
 test('detects metadata and transient Crossref statuses', () => {

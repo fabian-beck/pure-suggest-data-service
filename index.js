@@ -703,6 +703,70 @@ const logRequest = (logEntry, data, timeStart) => {
     console.log(JSON.stringify(logEntry));
 };
 
+const createSequentialRunner = () => {
+    let queue = Promise.resolve();
+
+    return task => {
+        const run = queue.then(task, task);
+        queue = run.catch(() => {});
+        return run;
+    };
+};
+
+const loadBulkPublicationData = async ({
+    dois,
+    refreshCache,
+    noCache,
+    prefetch,
+    collectPrefetchSignals,
+    prefetchContext,
+    dependencies = {}
+}) => {
+    const loadPublication = dependencies.loadPublicationData || loadPublicationData;
+    const markPrefetchComplete = dependencies.markPrefetchTaskComplete || markPrefetchTaskComplete;
+    const recordSignals = dependencies.recordPrefetchSignals || recordPrefetchSignals;
+    const writeLog = dependencies.logRequest || logRequest;
+    const runPrefetchSignalTask = createSequentialRunner();
+
+    const settledResults = await Promise.allSettled(dois.map(async doi => {
+        const result = await loadPublication({
+            doi,
+            refreshCache,
+            noCache,
+            collectPrefetchSignals: false,
+            prefetchContext
+        });
+
+        if (collectPrefetchSignals && result.data) {
+            await runPrefetchSignalTask(() => recordSignals({
+                sourceDoi: doi,
+                data: result.data,
+                context: prefetchContext,
+                logEntry: result.logEntry
+            }));
+        }
+
+        if (prefetch) {
+            try {
+                await markPrefetchComplete({ doi, data: result.data, logEntry: result.logEntry });
+            } catch (error) {
+                result.logEntry.prefetchTask = "mark-complete-error";
+                result.logEntry.prefetchTaskError = String(error).slice(0, 500);
+            }
+        }
+
+        writeLog(result.logEntry, result.data, result.timeStart);
+        return result.data;
+    }));
+    const rejectedResult = settledResults.find(result => result.status === "rejected");
+
+    if (rejectedResult) {
+        throw rejectedResult.reason;
+    }
+
+    return settledResults.map(result => result.value);
+};
+
 const getRequestLogContext = req => {
     const context = {
         method: req.method,
@@ -774,27 +838,14 @@ functions.http('pure-publications', async (req, res) => {
     const prefetchContext = { signalCount: 0, enqueueAttemptCount: 0 };
 
     if (isBulk) {
-        const results = [];
-        for (const doi of dois) {
-            const result = await loadPublicationData({
-                doi,
-                refreshCache,
-                noCache,
-                collectPrefetchSignals,
-                prefetchContext
-            });
-            if (prefetch) {
-                try {
-                    await markPrefetchTaskComplete({ doi, data: result.data, logEntry: result.logEntry });
-                } catch (error) {
-                    result.logEntry.prefetchTask = "mark-complete-error";
-                    result.logEntry.prefetchTaskError = String(error).slice(0, 500);
-                }
-            }
-            logRequest(result.logEntry, result.data, result.timeStart);
-            results.push(result.data);
-        }
-
+        const results = await loadBulkPublicationData({
+            dois,
+            refreshCache,
+            noCache,
+            prefetch,
+            collectPrefetchSignals,
+            prefetchContext
+        });
         console.log(JSON.stringify({
             severity: "INFO",
             tag: "bulk",
@@ -840,6 +891,7 @@ module.exports.__test = {
     getPrefetchTargetsByRelation,
     hasMetadata,
     isTransientCrossrefStatus,
+    loadBulkPublicationData,
     mergeMetadata,
     normalizeDoi,
     parseDoiInput,

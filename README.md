@@ -25,7 +25,7 @@ POST /pure-publications
 { "dois": ["10.1234/a", "10.1234/b"] }
 ```
 
-Bulk responses are ordered arrays of the same per-DOI objects returned by the single lookup. Each DOI is read from and written to the existing per-DOI cache entry.
+Bulk responses are ordered arrays of the same per-DOI objects returned by the single lookup. The service starts per-DOI lookups concurrently while preserving response order. Each DOI is read from and written to the existing per-DOI cache entry.
 
 ## Prefetching
 
