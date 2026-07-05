@@ -40,3 +40,25 @@ Tuning environment variables:
 - `PREFETCH_MAX_SIGNALS_PER_REQUEST` default `200`
 - `PREFETCH_MAX_ENQUEUES_PER_REQUEST` default `5`
 - `PREFETCH_REQUEUE_COOLDOWN_MS` default `86400000`
+
+## Log reports
+
+Generate a self-contained interactive HTML report from the structured Cloud Logging output of `pure-publications`:
+
+```
+python scripts/log_report.py --project pure-suggest-data-service --since 24h --output reports/latest-log-report.html
+```
+
+If `gcloud` is installed but not on the Python subprocess path, pass it explicitly:
+
+```
+python scripts/log_report.py --project pure-suggest-data-service --since 7d --limit 10000 --gcloud "C:\Users\ba5tm7\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd" --save-raw reports/latest-log-raw.json --output reports/latest-log-report.html
+```
+
+The report focuses on this service's operational questions: cache tags, provider status and latency, Crossref backoff/rate limiting, fallback metadata sources inferred from provider successes, bulk-request summaries, and prefetch queue signals. It keeps `404` provider misses visible without counting them as operational failures.
+
+Useful modes:
+
+- `--input reports/latest-log-raw.json` rerenders a saved `gcloud logging read --format=json` result without querying Google Cloud again.
+- `--demo` generates a small built-in report for a quick local smoke test.
+- `--filter-extra 'jsonPayload.tag="cache-refresh"'` adds an extra Cloud Logging filter clause.
