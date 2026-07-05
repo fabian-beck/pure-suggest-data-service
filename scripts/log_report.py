@@ -1236,40 +1236,41 @@ function renderTimeChart() {{
     target.innerHTML = '<div class="empty">No request timestamps available.</div>';
     return;
   }}
-  const width = 980;
-  const height = 260;
+  const slot = 14;
+  const barWidth = 10;
   const pad = 32;
+  const plotEnd = pad + (data.length - 1) * slot + barWidth;
+  const width = plotEnd + pad;
+  const height = 260;
   const max = Math.max(1, ...data.flatMap(point => [point.count, point.cacheHit, point.issues]));
-  const slot = (width - pad * 2) / data.length;
-  const barWidth = Math.max(3, Math.min(28, slot * 0.62));
   const y = value => height - pad - (Number(value) / max) * (height - pad * 2);
   const bars = data.map((point, index) => {{
-    const x = pad + index * slot + (slot - barWidth) / 2;
+    const x = pad + index * slot;
     const requestH = height - pad - y(point.count);
     const cacheH = height - pad - y(point.cacheHit);
     const issueH = height - pad - y(point.issues);
     return `
       <g>
         <title>${{escapeHtml(point.label)}}: ${{point.count}} requests, ${{point.cacheHit}} cache hits, ${{point.issues}} issues</title>
-        <rect x="${{x.toFixed(2)}}" y="${{y(point.count).toFixed(2)}}" width="${{barWidth.toFixed(2)}}" height="${{Math.max(1, requestH).toFixed(2)}}" fill="#2563eb" rx="2"></rect>
-        <rect x="${{(x + barWidth * 0.2).toFixed(2)}}" y="${{y(point.cacheHit).toFixed(2)}}" width="${{(barWidth * 0.28).toFixed(2)}}" height="${{Math.max(0, cacheH).toFixed(2)}}" fill="#15803d" rx="2"></rect>
-        <rect x="${{(x + barWidth * 0.58).toFixed(2)}}" y="${{y(point.issues).toFixed(2)}}" width="${{(barWidth * 0.28).toFixed(2)}}" height="${{Math.max(0, issueH).toFixed(2)}}" fill="#b91c1c" rx="2"></rect>
+        <rect x="${{x.toFixed(2)}}" y="${{y(point.count).toFixed(2)}}" width="${{barWidth.toFixed(2)}}" height="${{Math.max(1, requestH).toFixed(2)}}" fill="none" stroke="#2563eb" stroke-width="1.5" rx="1.5"></rect>
+        <rect x="${{(x + 2).toFixed(2)}}" y="${{y(point.cacheHit).toFixed(2)}}" width="3" height="${{Math.max(0, cacheH).toFixed(2)}}" fill="#15803d" rx="1"></rect>
+        <rect x="${{(x + 6).toFixed(2)}}" y="${{y(point.issues).toFixed(2)}}" width="3" height="${{Math.max(0, issueH).toFixed(2)}}" fill="#b91c1c" rx="1"></rect>
       </g>
     `;
   }}).join("");
   const axis = [0, 0.5, 1].map(factor => {{
     const value = Math.round(max * factor);
     const yy = y(value);
-    return `<g><line x1="${{pad}}" x2="${{width - pad}}" y1="${{yy}}" y2="${{yy}}" stroke="#d9dee8"></line><text x="4" y="${{yy + 4}}" font-size="11" fill="#667085">${{value}}</text></g>`;
+    return `<g><line x1="${{pad}}" x2="${{plotEnd}}" y1="${{yy}}" y2="${{yy}}" stroke="#d9dee8"></line><text x="4" y="${{yy + 4}}" font-size="11" fill="#667085">${{value}}</text></g>`;
   }}).join("");
   const first = escapeHtml(data[0].label);
   const last = escapeHtml(data[data.length - 1].label);
   target.innerHTML = `
-    <svg class="spark" viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Request volume over time">
+    <svg class="spark" style="width:${{width}}px;max-width:100%;" viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Request volume over time">
       ${{axis}}
       ${{bars}}
       <text x="${{pad}}" y="${{height - 6}}" font-size="11" fill="#667085">${{first}}</text>
-      <text x="${{width - pad}}" y="${{height - 6}}" font-size="11" text-anchor="end" fill="#667085">${{last}}</text>
+      <text x="${{plotEnd}}" y="${{height - 6}}" font-size="11" text-anchor="end" fill="#667085">${{last}}</text>
     </svg>
   `;
 }}
