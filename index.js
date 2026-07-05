@@ -682,6 +682,11 @@ const loadPublicationData = async ({ doi, refreshCache, noCache, collectPrefetch
         return { data: cachedData, logEntry: logEntry, timeStart: timeStart };
     }
 
+    if (refreshCache && cachedExpireAt > new Date() && hasMetadata(cachedData)) {
+        logEntry.tag = "cache-refresh-skipped";
+        return { data: cachedData, logEntry: logEntry, timeStart: timeStart };
+    }
+
     logEntry.tag = refreshCache ? "cache-refresh" : (noCache ? "cache-disabled" : (cachedEntry ? "cache-expired" : "cache-miss"));
     if (cachedExpireAt) {
         logEntry.cacheExpireAt = cachedExpireAt.toISOString();
