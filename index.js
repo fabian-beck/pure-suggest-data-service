@@ -11,6 +11,7 @@ const firestore = admin.firestore();
 
 const CROSSREF_BACKOFF_MS = 5 * 60 * 1000;
 const CROSSREF_USER_AGENT = "pure-suggest-data-service/0.0.1 (mailto:fabian.beck@uni-bamberg.de)";
+const PROVIDER_FETCH_TIMEOUT_MS = Number(process.env.PROVIDER_FETCH_TIMEOUT_MS || 10 * 1000);
 const OPENCITATIONS_ACCESS_TOKEN = "aa9da96d-3c7b-49c1-a2d8-1c2d01ae10a5";
 const OPENALEX_API_KEY = process.env.OPENALEX_API_KEY;
 const CLOUD_REGION = "europe-west1";
@@ -25,7 +26,7 @@ const PREFETCH_MAX_SIGNALS_PER_REQUEST = Number(process.env.PREFETCH_MAX_SIGNALS
 const PREFETCH_MAX_ENQUEUES_PER_REQUEST = Number(process.env.PREFETCH_MAX_ENQUEUES_PER_REQUEST || 5);
 const PREFETCH_REQUEUE_COOLDOWN_MS = Number(process.env.PREFETCH_REQUEUE_COOLDOWN_MS || 24 * 60 * 60 * 1000);
 
-const isTransientCrossrefStatus = status => status === 429 || (status >= 500 && status < 600) || status === "backoff" || status === "error";
+const isTransientCrossrefStatus = status => status === 429 || (status >= 500 && status < 600) || status === "backoff" || status === "error" || status === "timeout";
 const hasMetadata = entry => Boolean(entry?.title || entry?.author || entry?.container || entry?.abstract);
 
 const normalizeDoi = doi => String(doi ?? "").trim().toLowerCase();
@@ -139,6 +140,34 @@ const getCacheExpireDate = crossrefStatus => {
     return expireDate;
 };
 
+const fetchJson = async ({ url, headers, logEntry, logKey, statusField = "status", timeoutMs = PROVIDER_FETCH_TIMEOUT_MS }) => {
+    const timeStart = new Date().getTime();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    timeout.unref?.();
+
+    try {
+        const response = await fetch(url, {
+            headers: headers,
+            signal: controller.signal
+        });
+        const data = response.status === 200 ? await response.json() : null;
+        logEntry[logKey] = { [statusField]: response.status, processingTime: new Date().getTime() - timeStart };
+        return { status: response.status, data: data, response: response };
+    } catch (error) {
+        const status = error?.name === "AbortError" ? "timeout" : "error";
+        logEntry[logKey] = {
+            [statusField]: status,
+            error: String(error).slice(0, 500),
+            processingTime: new Date().getTime() - timeStart,
+            timeoutMs: timeoutMs
+        };
+        return { status: status, data: null, error: error };
+    } finally {
+        clearTimeout(timeout);
+    }
+};
+
 const getShortRetryExpireDate = () => {
     const expireDate = new Date();
     expireDate.setMinutes(expireDate.getMinutes() + 15);
@@ -158,83 +187,53 @@ const fetchCrossref = async (doi, logEntry) => {
         return { status: "backoff", data: null, transientFailure: true };
     }
 
-    const timeStartCrossref = new Date().getTime();
-    try {
-        const responseCrossref = await fetch(`https://api.crossref.org/v1/works/${doi}?mailto=fabian.beck@uni-bamberg.de`, {
-            headers: {
-                "User-Agent": CROSSREF_USER_AGENT,
-            }
-        });
-        const dataCrossref = responseCrossref.status === 200 ? (await responseCrossref.json())?.message : null;
-        const transientFailure = isTransientCrossrefStatus(responseCrossref.status);
-        logEntry.crossref = { status: responseCrossref.status, processingTime: new Date().getTime() - timeStartCrossref };
+    const crossref = await fetchJson({
+        url: `https://api.crossref.org/v1/works/${doi}?mailto=fabian.beck@uni-bamberg.de`,
+        headers: {
+            "User-Agent": CROSSREF_USER_AGENT,
+        },
+        logEntry: logEntry,
+        logKey: "crossref"
+    });
+    const dataCrossref = crossref.data?.message || null;
+    const transientFailure = isTransientCrossrefStatus(crossref.status);
 
-        if (transientFailure) {
-            const backoffUntil = getCrossrefBackoffUntil(responseCrossref);
-            logEntry.crossref.backoffUntil = backoffUntil.toISOString();
-            await crossrefStateRef.set({
-                backoffUntil: backoffUntil,
-                status: responseCrossref.status,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        }
-
-        return { status: responseCrossref.status, data: dataCrossref, transientFailure: transientFailure };
-    } catch (error) {
-        const backoffUntil = getCrossrefBackoffUntil();
-        logEntry.crossref = {
-            status: "error",
-            error: String(error),
-            processingTime: new Date().getTime() - timeStartCrossref,
-            backoffUntil: backoffUntil.toISOString()
-        };
-        await crossrefStateRef.set({
+    if (transientFailure) {
+        const backoffUntil = getCrossrefBackoffUntil(crossref.response);
+        const crossrefStateUpdate = {
             backoffUntil: backoffUntil,
-            status: "error",
-            error: String(error).slice(0, 500),
+            status: crossref.status,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-
-        return { status: "error", data: null, transientFailure: true };
+        };
+        logEntry.crossref.backoffUntil = backoffUntil.toISOString();
+        if (crossref.error) {
+            crossrefStateUpdate.error = String(crossref.error).slice(0, 500);
+        }
+        await crossrefStateRef.set(crossrefStateUpdate, { merge: true });
     }
+
+    return { status: crossref.status, data: dataCrossref, transientFailure: transientFailure };
 };
 
 const fetchDataCite = async (doi, logEntry) => {
-    const timeStartDataCite = new Date().getTime();
-    try {
-        const responseDataCite = await fetch(`https://api.datacite.org/dois/${doi}`);
-        const dataDataCite = responseDataCite.status === 200 ? (await responseDataCite.json())?.data : null;
-        logEntry.dataCite = { status: responseDataCite.status, processingTime: new Date().getTime() - timeStartDataCite };
-        return dataDataCite;
-    } catch (error) {
-        logEntry.dataCite = {
-            status: "error",
-            error: String(error).slice(0, 500),
-            processingTime: new Date().getTime() - timeStartDataCite
-        };
-        return null;
-    }
+    const dataCite = await fetchJson({
+        url: `https://api.datacite.org/dois/${doi}`,
+        logEntry: logEntry,
+        logKey: "dataCite"
+    });
+    return dataCite.data?.data || null;
 };
 
 const fetchOpenCitationsMeta = async (doi, logEntry) => {
-    const timeStartOpenCitationsMeta = new Date().getTime();
-    try {
-        const responseOpenCitationsMeta = await fetch(`https://api.opencitations.net/meta/v1/metadata/doi:${doi}`, {
-            headers: {
-                authorization: OPENCITATIONS_ACCESS_TOKEN,
-            }
-        });
-        const dataOpenCitationsMeta = responseOpenCitationsMeta.status === 200 ? (await responseOpenCitationsMeta.json())?.[0] : null;
-        logEntry.openCitationsMeta = { status: responseOpenCitationsMeta.status, processingTime: new Date().getTime() - timeStartOpenCitationsMeta };
-        return dataOpenCitationsMeta;
-    } catch (error) {
-        logEntry.openCitationsMeta = {
-            status: "error",
-            error: String(error).slice(0, 500),
-            processingTime: new Date().getTime() - timeStartOpenCitationsMeta
-        };
-        return null;
-    }
+    const openCitationsMeta = await fetchJson({
+        url: `https://api.opencitations.net/meta/v1/metadata/doi:${doi}`,
+        headers: {
+            authorization: OPENCITATIONS_ACCESS_TOKEN,
+        },
+        logEntry: logEntry,
+        logKey: "openCitationsMeta"
+    });
+    return openCitationsMeta.data?.[0] || null;
 };
 
 const fetchOpenAlex = async (doi, logEntry) => {
@@ -243,20 +242,12 @@ const fetchOpenAlex = async (doi, logEntry) => {
         return null;
     }
 
-    const timeStartOpenAlex = new Date().getTime();
-    try {
-        const responseOpenAlex = await fetch(`https://api.openalex.org/works/${encodeURIComponent(`doi:${doi}`)}?api_key=${encodeURIComponent(OPENALEX_API_KEY)}`);
-        const dataOpenAlex = responseOpenAlex.status === 200 ? (await responseOpenAlex.json()) : null;
-        logEntry.openAlex = { status: responseOpenAlex.status, processingTime: new Date().getTime() - timeStartOpenAlex };
-        return dataOpenAlex;
-    } catch (error) {
-        logEntry.openAlex = {
-            status: "error",
-            error: String(error).slice(0, 500),
-            processingTime: new Date().getTime() - timeStartOpenAlex
-        };
-        return null;
-    }
+    const openAlex = await fetchJson({
+        url: `https://api.openalex.org/works/${encodeURIComponent(`doi:${doi}`)}?api_key=${encodeURIComponent(OPENALEX_API_KEY)}`,
+        logEntry: logEntry,
+        logKey: "openAlex"
+    });
+    return openAlex.data;
 };
 
 const cleanOpenCitationsAuthor = author => author?.split("; ").map(authorEntry => {
@@ -343,33 +334,23 @@ const mergeMetadata = (doi, dataCrossref, dataDataCite, dataOpenCitationsMeta, d
 const addOpenCitations = async (doi, data, dataCrossref, logEntry) => {
     // if not too many citations (is-referenced-by-count)
     if (!dataCrossref || dataCrossref["is-referenced-by-count"] < 1000) {
-        const timeStartOpenCitations = new Date().getTime();
         data.citation = "";
-        try {
-            const responseOCCitations = await fetch(`https://opencitations.net/index/api/v2/citations/doi:${doi}`, {
-                headers: {
-                    authorization: OPENCITATIONS_ACCESS_TOKEN,
-                }
-            });
-            const dataOCCitations = responseOCCitations.status === 200 ? (await responseOCCitations.json()) : null;
-            dataOCCitations?.forEach(reference => {
-                // extract doi from citing
-                const doi = reference.citing?.match(/doi:(\S*)\s?/i)?.[1];
-                if (doi) {
-                    data.citation += doi + "; ";
-                }
-            });
-            logEntry.openCitations = {
-                statusCitations: responseOCCitations.status,
-                processingTime: new Date().getTime() - timeStartOpenCitations
-            };
-        } catch (error) {
-            logEntry.openCitations = {
-                statusCitations: "error",
-                error: String(error).slice(0, 500),
-                processingTime: new Date().getTime() - timeStartOpenCitations
-            };
-        }
+        const citations = await fetchJson({
+            url: `https://opencitations.net/index/api/v2/citations/doi:${doi}`,
+            headers: {
+                authorization: OPENCITATIONS_ACCESS_TOKEN,
+            },
+            logEntry: logEntry,
+            logKey: "openCitations",
+            statusField: "statusCitations"
+        });
+        citations.data?.forEach(reference => {
+            // extract doi from citing
+            const doi = reference.citing?.match(/doi:(\S*)\s?/i)?.[1];
+            if (doi) {
+                data.citation += doi + "; ";
+            }
+        });
     } else {
         data.tooManyCitations = true;
     }
