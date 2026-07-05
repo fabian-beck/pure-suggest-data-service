@@ -25,6 +25,7 @@ const PREFETCH_MAX_DOIS_PER_RELATION = Number(process.env.PREFETCH_MAX_DOIS_PER_
 const PREFETCH_MAX_SIGNALS_PER_REQUEST = Number(process.env.PREFETCH_MAX_SIGNALS_PER_REQUEST || 200);
 const PREFETCH_MAX_ENQUEUES_PER_REQUEST = Number(process.env.PREFETCH_MAX_ENQUEUES_PER_REQUEST || 5);
 const PREFETCH_REQUEUE_COOLDOWN_MS = Number(process.env.PREFETCH_REQUEUE_COOLDOWN_MS || 24 * 60 * 60 * 1000);
+const PREFETCH_SIGNAL_TASK_DOIS_PER_REQUEST = Math.max(1, Number(process.env.PREFETCH_SIGNAL_TASK_DOIS_PER_REQUEST || 10));
 
 const isTransientCrossrefStatus = status => status === 429 || (status >= 500 && status < 600) || status === "backoff" || status === "error" || status === "timeout";
 const hasMetadata = entry => Boolean(entry?.title || entry?.author || entry?.container || entry?.abstract);
@@ -43,6 +44,16 @@ const parseDoiInput = (value, splitStrings = false) => {
 
     const doiValues = splitStrings ? value.split(/[\s,;]+/g) : [value];
     return doiValues.map(normalizeDoi).filter(Boolean);
+};
+
+const chunkArray = (items, size) => {
+    const chunks = [];
+
+    for (let index = 0; index < items.length; index += size) {
+        chunks.push(items.slice(index, index + size));
+    }
+
+    return chunks;
 };
 
 const getDoiRequestInput = req => {
@@ -466,6 +477,27 @@ const enqueuePrefetchTask = async ({ doi }) => {
     return enqueueHttpTask({ queue: PREFETCH_QUEUE, url: prefetchUrl });
 };
 
+const enqueuePrefetchSignalTasks = async ({ dois, dependencies = {} }) => {
+    const enqueueTask = dependencies.enqueueHttpTask || enqueueHttpTask;
+    const chunks = chunkArray(dois, PREFETCH_SIGNAL_TASK_DOIS_PER_REQUEST);
+    const settledTasks = await Promise.allSettled(chunks.map(chunk => {
+        const signalUrl = `${FUNCTION_URL}?dois=${encodeURIComponent(chunk.join(","))}&recordPrefetchSignals=true`;
+        return enqueueTask({ queue: PREFETCH_QUEUE, url: signalUrl });
+    }));
+
+    return settledTasks.reduce((summary, result) => {
+        summary.chunkCount++;
+        if (result.status === "fulfilled") {
+            summary.queuedCount++;
+            summary.taskNames.push(result.value?.name);
+        } else {
+            summary.errorCount++;
+            summary.lastError = String(result.reason).slice(0, 500);
+        }
+        return summary;
+    }, { chunkCount: 0, queuedCount: 0, errorCount: 0, taskNames: [] });
+};
+
 const markPrefetchEnqueueError = async (doi, error) => {
     await getPrefetchCandidateRef(doi).set({
         status: "enqueue-error",
@@ -703,14 +735,36 @@ const logRequest = (logEntry, data, timeStart) => {
     console.log(JSON.stringify(logEntry));
 };
 
-const createSequentialRunner = () => {
-    let queue = Promise.resolve();
+const processPrefetchSignalTask = async ({ dois, prefetchContext, dependencies = {} }) => {
+    const loadPublication = dependencies.loadPublicationData || loadPublicationData;
+    const recordSignals = dependencies.recordPrefetchSignals || recordPrefetchSignals;
+    const writeLog = dependencies.logRequest || logRequest;
+    const results = [];
 
-    return task => {
-        const run = queue.then(task, task);
-        queue = run.catch(() => {});
-        return run;
-    };
+    for (const doi of dois) {
+        const result = await loadPublication({
+            doi,
+            refreshCache: false,
+            noCache: false,
+            collectPrefetchSignals: false,
+            prefetchContext
+        });
+        result.logEntry.prefetchSignalTask = true;
+
+        if (result.data) {
+            await recordSignals({
+                sourceDoi: doi,
+                data: result.data,
+                context: prefetchContext,
+                logEntry: result.logEntry
+            });
+        }
+
+        writeLog(result.logEntry, result.data, result.timeStart);
+        results.push(result.data);
+    }
+
+    return results;
 };
 
 const loadBulkPublicationData = async ({
@@ -718,15 +772,12 @@ const loadBulkPublicationData = async ({
     refreshCache,
     noCache,
     prefetch,
-    collectPrefetchSignals,
     prefetchContext,
     dependencies = {}
 }) => {
     const loadPublication = dependencies.loadPublicationData || loadPublicationData;
     const markPrefetchComplete = dependencies.markPrefetchTaskComplete || markPrefetchTaskComplete;
-    const recordSignals = dependencies.recordPrefetchSignals || recordPrefetchSignals;
     const writeLog = dependencies.logRequest || logRequest;
-    const runPrefetchSignalTask = createSequentialRunner();
 
     const settledResults = await Promise.allSettled(dois.map(async doi => {
         const result = await loadPublication({
@@ -737,14 +788,6 @@ const loadBulkPublicationData = async ({
             prefetchContext
         });
 
-        if (collectPrefetchSignals && result.data) {
-            await runPrefetchSignalTask(() => recordSignals({
-                sourceDoi: doi,
-                data: result.data,
-                context: prefetchContext,
-                logEntry: result.logEntry
-            }));
-        }
 
         if (prefetch) {
             try {
@@ -773,7 +816,8 @@ const getRequestLogContext = req => {
         requestUrl: req.originalUrl || req.url,
         refreshCache: isTruthyFlag(req.query.refreshCache) || isTruthyFlag(req.body?.refreshCache) || undefined,
         noCache: isTruthyFlag(req.query.noCache) || isTruthyFlag(req.body?.noCache) || undefined,
-        prefetch: isTruthyFlag(req.query.prefetch) || isTruthyFlag(req.body?.prefetch) || undefined
+        prefetch: isTruthyFlag(req.query.prefetch) || isTruthyFlag(req.body?.prefetch) || undefined,
+        recordPrefetchSignals: isTruthyFlag(req.query.recordPrefetchSignals) || isTruthyFlag(req.body?.recordPrefetchSignals) || undefined
     };
 
     try {
@@ -834,8 +878,23 @@ functions.http('pure-publications', async (req, res) => {
     const refreshCache = isTruthyFlag(req.query.refreshCache) || isTruthyFlag(req.body?.refreshCache);
     const noCache = isTruthyFlag(req.query.noCache) || isTruthyFlag(req.body?.noCache);
     const prefetch = isTruthyFlag(req.query.prefetch) || isTruthyFlag(req.body?.prefetch);
-    const collectPrefetchSignals = !refreshCache && !prefetch;
+    const recordPrefetchSignalsOnly = isTruthyFlag(req.query.recordPrefetchSignals) || isTruthyFlag(req.body?.recordPrefetchSignals);
+    const collectPrefetchSignals = !refreshCache && !prefetch && !recordPrefetchSignalsOnly;
     const prefetchContext = { signalCount: 0, enqueueAttemptCount: 0 };
+
+    if (recordPrefetchSignalsOnly) {
+        await processPrefetchSignalTask({ dois, prefetchContext });
+        console.log(JSON.stringify({
+            severity: "INFO",
+            tag: "prefetch-signals",
+            doiCount: dois.length,
+            prefetchSignals: prefetchContext.signalCount,
+            prefetchEnqueueAttempts: prefetchContext.enqueueAttemptCount,
+            processingTime: new Date().getTime() - timeStart
+        }));
+        res.status(204).send('');
+        return;
+    }
 
     if (isBulk) {
         const results = await loadBulkPublicationData({
@@ -843,16 +902,18 @@ functions.http('pure-publications', async (req, res) => {
             refreshCache,
             noCache,
             prefetch,
-            collectPrefetchSignals,
             prefetchContext
         });
+        const prefetchSignalTasks = collectPrefetchSignals
+            ? await enqueuePrefetchSignalTasks({ dois })
+            : null;
         console.log(JSON.stringify({
             severity: "INFO",
             tag: "bulk",
             doiCount: dois.length,
             prefetch: prefetch || undefined,
-            prefetchSignals: collectPrefetchSignals ? prefetchContext.signalCount : undefined,
-            prefetchEnqueueAttempts: collectPrefetchSignals ? prefetchContext.enqueueAttemptCount : undefined,
+            prefetchSignalTaskCount: prefetchSignalTasks?.queuedCount,
+            prefetchSignalTaskErrors: prefetchSignalTasks?.errorCount || undefined,
             processingTime: new Date().getTime() - timeStart
         }));
         res.send(results);
@@ -863,7 +924,7 @@ functions.http('pure-publications', async (req, res) => {
         doi: dois[0],
         refreshCache,
         noCache,
-        collectPrefetchSignals,
+        collectPrefetchSignals: false,
         prefetchContext
     });
     if (prefetch) {
@@ -873,6 +934,9 @@ functions.http('pure-publications', async (req, res) => {
             result.logEntry.prefetchTask = "mark-complete-error";
             result.logEntry.prefetchTaskError = String(error).slice(0, 500);
         }
+    }
+    if (collectPrefetchSignals) {
+        result.logEntry.prefetchSignalTasks = await enqueuePrefetchSignalTasks({ dois: [dois[0]] });
     }
     logRequest(result.logEntry, result.data, result.timeStart);
     res.send(result.data);
@@ -886,12 +950,14 @@ functions.http('pure-publications', async (req, res) => {
 
 module.exports.__test = {
     addOpenCitations,
+    enqueuePrefetchSignalTasks,
     fetchJson,
     getDoiRequestInput,
     getPrefetchTargetsByRelation,
     hasMetadata,
     isTransientCrossrefStatus,
     loadBulkPublicationData,
+    processPrefetchSignalTask,
     mergeMetadata,
     normalizeDoi,
     parseDoiInput,
