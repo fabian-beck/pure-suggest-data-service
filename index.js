@@ -16,9 +16,60 @@ const CLOUD_REGION = "europe-west1";
 const PROJECT_ID = process.env.GCP_PROJECT || process.env.GCLOUD_PROJECT || "pure-suggest-data-service";
 const REFRESH_QUEUE = "pure-publications-refresh";
 const FUNCTION_URL = `https://${CLOUD_REGION}-${PROJECT_ID}.cloudfunctions.net/pure-publications`;
+const MAX_BULK_DOIS = 50;
 
 const isTransientCrossrefStatus = status => status === 429 || (status >= 500 && status < 600) || status === "backoff" || status === "error";
 const hasMetadata = entry => Boolean(entry?.title || entry?.author || entry?.container || entry?.abstract);
+
+const normalizeDoi = doi => String(doi ?? "").trim().toLowerCase();
+
+const parseDoiInput = (value, splitStrings = false) => {
+    if (Array.isArray(value)) {
+        return value.flatMap(item => parseDoiInput(item, splitStrings));
+    }
+    if (typeof value !== "string") {
+        return [];
+    }
+
+    const doiValues = splitStrings ? value.split(/[\s,;]+/g) : [value];
+    return doiValues.map(normalizeDoi).filter(Boolean);
+};
+
+const getDoiRequestInput = req => {
+    const dois = [];
+    let isBulk = false;
+
+    if (Array.isArray(req.query.doi)) {
+        isBulk = true;
+        dois.push(...parseDoiInput(req.query.doi));
+    } else {
+        dois.push(...parseDoiInput(req.query.doi));
+    }
+
+    if (req.query.dois !== undefined) {
+        isBulk = true;
+        dois.push(...parseDoiInput(req.query.dois, true));
+    }
+
+    if (req.method === "POST") {
+        if (Array.isArray(req.body)) {
+            isBulk = true;
+            dois.push(...parseDoiInput(req.body));
+        } else if (req.body && typeof req.body === "object") {
+            if (Array.isArray(req.body.doi)) {
+                isBulk = true;
+            }
+            dois.push(...parseDoiInput(req.body.doi));
+
+            if (req.body.dois !== undefined) {
+                isBulk = true;
+                dois.push(...parseDoiInput(req.body.dois, true));
+            }
+        }
+    }
+
+    return { dois: dois, isBulk: isBulk || dois.length > 1 };
+};
 
 const getCrossrefBackoffUntil = response => {
     const retryAfter = response?.headers?.get?.("retry-after");
@@ -360,42 +411,14 @@ const enqueueRefreshTask = async ({ doi, doiRef, cachedEntry, logEntry }) => {
     logEntry.refresh = "queued";
     logEntry.refreshTask = task.name;
 };
-const logRequest = (logEntry, data, timeStart) => {
-    logEntry.title = data?.title;
-    logEntry.processingTime = new Date().getTime() - timeStart;
-    console.log(JSON.stringify(logEntry));
-};
 
-// Retrieve aggregated data from Crossref (or DataCite) and OpenCitations
-// deploy with: "gcloud functions deploy pure-publications --gen2 --runtime=nodejs24 --region=europe-west1 --source=. --entry-point=pure-publications --trigger-http --allow-unauthenticated"
-functions.http('pure-publications', async (req, res) => {
+const loadPublicationData = async ({ doi, refreshCache, noCache }) => {
     const timeStart = new Date().getTime();
-    const logEntry = { severity: "INFO" };
-
-    res.set('Content-Type', 'application/json');
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'GET');
-
-    if (req.method === "OPTIONS") {
-        // stop preflight requests here
-        res.status(204).send('');
-        return;
-    }
-
-    if (typeof req.query.doi !== "string" || !req.query.doi) {
-        res.status(400).send('Missing DOI parameter');
-        return;
-    }
-
-    const doi = req.query.doi.toLowerCase();
-    const refreshCache = req.query.refreshCache === "true";
-    const noCache = req.query.noCache === "true";
+    const logEntry = { severity: "INFO", doi: doi };
     const bypassCache = noCache || refreshCache;
-    logEntry.doi = doi;
 
     // Convert forward to backward slashes in doi
-    const doi2 = doi.replace(/\//g, '\\');
-    const doiRef = firestore.collection('pure-publications').doc(doi2);
+    const doiRef = firestore.collection('pure-publications').doc(doi.replace(/\//g, '\\'));
     const doiDoc = await doiRef.get();
     const cachedEntry = doiDoc.exists ? doiDoc.data() : null;
     const cachedData = cachedEntry?.data;
@@ -403,9 +426,7 @@ functions.http('pure-publications', async (req, res) => {
 
     if (!bypassCache && cachedExpireAt > new Date()) {
         logEntry.tag = "cache-hit";
-        logRequest(logEntry, cachedData, timeStart);
-        res.send(cachedData);
-        return;
+        return { data: cachedData, logEntry: logEntry, timeStart: timeStart };
     }
 
     if (!bypassCache && hasMetadata(cachedData)) {
@@ -419,9 +440,7 @@ functions.http('pure-publications', async (req, res) => {
             logEntry.refresh = "enqueue-error";
             logEntry.refreshError = String(error).slice(0, 500);
         }
-        logRequest(logEntry, cachedData, timeStart);
-        res.send(cachedData);
-        return;
+        return { data: cachedData, logEntry: logEntry, timeStart: timeStart };
     }
 
     logEntry.tag = refreshCache ? "cache-refresh" : (noCache ? "cache-disabled" : (cachedEntry ? "cache-expired" : "cache-miss"));
@@ -430,6 +449,69 @@ functions.http('pure-publications', async (req, res) => {
     }
 
     const data = await refreshPublicationData({ doi, doiRef, cachedEntry, noCache, logEntry });
-    logRequest(logEntry, data, timeStart);
-    res.send(data);
+    return { data: data, logEntry: logEntry, timeStart: timeStart };
+};
+
+const logRequest = (logEntry, data, timeStart) => {
+    logEntry.title = data?.title;
+    logEntry.processingTime = new Date().getTime() - timeStart;
+    console.log(JSON.stringify(logEntry));
+};
+
+// Retrieve aggregated data from Crossref (or DataCite) and OpenCitations
+// deploy with: "gcloud functions deploy pure-publications --gen2 --runtime=nodejs24 --region=europe-west1 --source=. --entry-point=pure-publications --trigger-http --allow-unauthenticated"
+functions.http('pure-publications', async (req, res) => {
+    const timeStart = new Date().getTime();
+
+    res.set('Content-Type', 'application/json');
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'GET, POST');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === "OPTIONS") {
+        // stop preflight requests here
+        res.status(204).send('');
+        return;
+    }
+
+    if (req.method !== "GET" && req.method !== "POST") {
+        res.status(405).send('Method not allowed');
+        return;
+    }
+
+    const { dois, isBulk } = getDoiRequestInput(req);
+    if (dois.length === 0) {
+        res.status(400).send('Missing DOI parameter');
+        return;
+    }
+
+    if (dois.length > MAX_BULK_DOIS) {
+        res.status(400).send(`Too many DOI parameters; maximum is ${MAX_BULK_DOIS}`);
+        return;
+    }
+
+    const refreshCache = req.query.refreshCache === "true" || req.body?.refreshCache === true || req.body?.refreshCache === "true";
+    const noCache = req.query.noCache === "true" || req.body?.noCache === true || req.body?.noCache === "true";
+
+    if (isBulk) {
+        const results = [];
+        for (const doi of dois) {
+            const result = await loadPublicationData({ doi, refreshCache, noCache });
+            logRequest(result.logEntry, result.data, result.timeStart);
+            results.push(result.data);
+        }
+
+        console.log(JSON.stringify({
+            severity: "INFO",
+            tag: "bulk",
+            doiCount: dois.length,
+            processingTime: new Date().getTime() - timeStart
+        }));
+        res.send(results);
+        return;
+    }
+
+    const result = await loadPublicationData({ doi: dois[0], refreshCache, noCache });
+    logRequest(result.logEntry, result.data, result.timeStart);
+    res.send(result.data);
 });
