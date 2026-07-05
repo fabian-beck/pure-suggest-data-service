@@ -201,10 +201,19 @@ const fetchCrossref = async (doi, logEntry) => {
 
 const fetchDataCite = async (doi, logEntry) => {
     const timeStartDataCite = new Date().getTime();
-    const responseDataCite = await fetch(`https://api.datacite.org/dois/${doi}`);
-    const dataDataCite = responseDataCite.status === 200 ? (await responseDataCite.json())?.data : null;
-    logEntry.dataCite = { status: responseDataCite.status, processingTime: new Date().getTime() - timeStartDataCite };
-    return dataDataCite;
+    try {
+        const responseDataCite = await fetch(`https://api.datacite.org/dois/${doi}`);
+        const dataDataCite = responseDataCite.status === 200 ? (await responseDataCite.json())?.data : null;
+        logEntry.dataCite = { status: responseDataCite.status, processingTime: new Date().getTime() - timeStartDataCite };
+        return dataDataCite;
+    } catch (error) {
+        logEntry.dataCite = {
+            status: "error",
+            error: String(error).slice(0, 500),
+            processingTime: new Date().getTime() - timeStartDataCite
+        };
+        return null;
+    }
 };
 
 const fetchOpenCitationsMeta = async (doi, logEntry) => {
@@ -336,23 +345,31 @@ const addOpenCitations = async (doi, data, dataCrossref, logEntry) => {
     if (!dataCrossref || dataCrossref["is-referenced-by-count"] < 1000) {
         const timeStartOpenCitations = new Date().getTime();
         data.citation = "";
-        const responseOCCitations = await fetch(`https://opencitations.net/index/api/v2/citations/doi:${doi}`, {
-            headers: {
-                authorization: OPENCITATIONS_ACCESS_TOKEN,
-            }
-        });
-        const dataOCCitations = responseOCCitations.status === 200 ? (await responseOCCitations.json()) : null;
-        dataOCCitations?.forEach(reference => {
-            // extract doi from citing
-            const doi = reference.citing.match(/doi:(\S*)\s?/i)?.[1];
-            if (doi) {
-                data.citation += doi + "; ";
-            }
-        });
-        logEntry.openCitations = {
-            statusCitations: responseOCCitations.status,
-            processingTime: new Date().getTime() - timeStartOpenCitations
-        };
+        try {
+            const responseOCCitations = await fetch(`https://opencitations.net/index/api/v2/citations/doi:${doi}`, {
+                headers: {
+                    authorization: OPENCITATIONS_ACCESS_TOKEN,
+                }
+            });
+            const dataOCCitations = responseOCCitations.status === 200 ? (await responseOCCitations.json()) : null;
+            dataOCCitations?.forEach(reference => {
+                // extract doi from citing
+                const doi = reference.citing?.match(/doi:(\S*)\s?/i)?.[1];
+                if (doi) {
+                    data.citation += doi + "; ";
+                }
+            });
+            logEntry.openCitations = {
+                statusCitations: responseOCCitations.status,
+                processingTime: new Date().getTime() - timeStartOpenCitations
+            };
+        } catch (error) {
+            logEntry.openCitations = {
+                statusCitations: "error",
+                error: String(error).slice(0, 500),
+                processingTime: new Date().getTime() - timeStartOpenCitations
+            };
+        }
     } else {
         data.tooManyCitations = true;
     }
