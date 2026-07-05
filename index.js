@@ -827,3 +827,16 @@ functions.http('pure-publications', async (req, res) => {
         }
     }
 });
+
+module.exports.__test = {
+    addOpenCitations,
+    fetchJson,
+    getDoiRequestInput,
+    getPrefetchTargetsByRelation,
+    hasMetadata,
+    isTransientCrossrefStatus,
+    mergeMetadata,
+    normalizeDoi,
+    parseDoiInput,
+    toDoiDocId
+};

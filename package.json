@@ -4,7 +4,8 @@
   "description": "Providing data to PURE suggest",
   "main": "index.js",
   "scripts": {
-    "start": "npx functions-framework --target=doidata --signature-type=http"
+    "start": "npx functions-framework --target=doidata --signature-type=http",
+    "test": "node --test --test-isolation=none"
   },
   "author": "Fabian Beck",
   "license": "MIT",
