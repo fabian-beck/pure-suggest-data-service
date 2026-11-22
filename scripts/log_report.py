@@ -397,7 +397,9 @@ def summarize(entries: list[dict[str, Any]], args: argparse.Namespace, log_filte
     events.sort(key=lambda item: item.get("_timestamp") or "")
 
     request_events = [
-        event for event in events if event.get("doi") and event.get("tag") != "bulk"
+        event
+        for event in events
+        if event.get("doi") and event.get("tag") not in ("bulk", "prefetch-source")
     ]
     bulk_events = [event for event in events if event.get("tag") == "bulk"]
     timestamps = [
@@ -463,7 +465,7 @@ def summarize(entries: list[dict[str, Any]], args: argparse.Namespace, log_filte
 
     prefetch_totals = dict.fromkeys(PREFETCH_KEYS, 0)
     prefetch_budget_exhausted = 0
-    for event in request_events:
+    for event in events:
         prefetch = event.get("prefetch")
         if not isinstance(prefetch, dict):
             continue
