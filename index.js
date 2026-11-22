@@ -1,11 +1,10 @@
 
 'use strict';
 
-const crypto = require('crypto');
 const functions = require('@google-cloud/functions-framework');
 
 const store = require('./store');
-const { firestore, FieldValue, normalizeDoi, toDoiDocId } = store;
+const { normalizeDoi, toDoiDocId } = store;
 
 const CROSSREF_BACKOFF_MS = 5 * 60 * 1000;
 const CROSSREF_USER_AGENT = "pure-suggest-data-service/0.0.1 (mailto:fabian.beck@uni-bamberg.de)";
@@ -104,9 +103,6 @@ const getDoiRequestInput = req => {
     return { dois: dois, isBulk: isBulk || dois.length > 1 };
 };
 
-const hashPrefetchObservationId = (sourceDoi, targetDoi) =>
-    crypto.createHash("sha256").update(`${sourceDoi}\0${targetDoi}`).digest("hex");
-
 const getPrefetchTargetsByRelation = data => {
     const relationTargets = {
         reference: parseDoiInput(data?.reference, true).slice(0, PREFETCH_MAX_DOIS_PER_RELATION),
@@ -135,8 +131,7 @@ const getPrefetchTargetsByRelation = data => {
 };
 
 const getLatestDate = (...values) => values
-    .map(value => value?.toDate?.() || value)
-    .filter(value => value instanceof Date && !Number.isNaN(value.getTime()))
+    .filter(value => value instanceof Date)
     .sort((a, b) => b.getTime() - a.getTime())[0];
 
 const getCrossrefBackoffUntil = response => {
@@ -454,6 +449,9 @@ const refreshPublicationData = async ({ doi, cachedEntry, noCache, logEntry }) =
 
     logEntry.cacheWrite = crossref.transientFailure && storedData ? "preserved-stale" : "stored";
     const entry = { data: data, source: source };
+    if (cachedEntry?.prefetchSignalsAt) {
+        entry.prefetchSignalsAt = cachedEntry.prefetchSignalsAt;
+    }
     if (hasMetadata(data)) {
         const metadataFetchedAt = metadataDue && !crossref.transientFailure ? new Date(now) : cachedEntry?.metadataFetchedAt;
         const citationsFetchedAt = citationsUpToDate ? new Date(now) : cachedEntry?.citationsFetchedAt;
@@ -553,154 +551,68 @@ const enqueuePrefetchSignalTasks = async ({ dois, dependencies = {} }) => {
     }, { chunkCount: 0, queuedCount: 0, errorCount: 0, taskNames: [] });
 };
 
-const markPrefetchEnqueueError = async (doi, error) => {
-    await store.prefetchCandidateRef(doi).set({
-        status: "enqueue-error",
-        failedAt: FieldValue.serverTimestamp(),
-        lastError: String(error).slice(0, 500)
-    }, { merge: true });
-};
-
-const recordPrefetchCandidate = async ({ sourceDoi, targetDoi, relationTypes, allowQueue }) => {
-    const normalizedSourceDoi = normalizeDoi(sourceDoi);
-    const normalizedTargetDoi = normalizeDoi(targetDoi);
-    const normalizedRelationTypes = relationTypes?.length ? relationTypes : ["related"];
-
-    if (!normalizedTargetDoi || normalizedTargetDoi === normalizedSourceDoi) {
-        return { status: "skipped", shouldQueue: false };
-    }
-
-    const observationRef = firestore.collection('prefetch-observations')
-        .doc(hashPrefetchObservationId(normalizedSourceDoi, normalizedTargetDoi));
-    const candidateRef = store.prefetchCandidateRef(normalizedTargetDoi);
-    const publicationRef = store.publicationRef(normalizedTargetDoi);
-
-    return firestore.runTransaction(async transaction => {
-        const observationDoc = await transaction.get(observationRef);
-        if (observationDoc.exists) {
-            return { status: "already-observed", shouldQueue: false };
-        }
-
-        const candidateDoc = await transaction.get(candidateRef);
-        const publicationDoc = await transaction.get(publicationRef);
-        const candidate = candidateDoc.exists ? candidateDoc.data() : {};
-        const cachedPublication = publicationDoc.exists ? publicationDoc.data() : null;
-        const cachedHasMetadata = hasMetadata(cachedPublication?.data);
-        const latestHandledAt = getLatestDate(candidate.queuedAt, candidate.fetchedAt, candidate.failedAt);
-        const inCooldown = latestHandledAt && latestHandledAt > new Date(Date.now() - PREFETCH_REQUEUE_COOLDOWN_MS);
-        const nextUniqueSourceCount = (candidate.uniqueSourceCount || 0) + 1;
-        const shouldQueue = Boolean(allowQueue
-            && !cachedHasMetadata
-            && candidate.status !== "suppressed"
-            && nextUniqueSourceCount >= PREFETCH_SIGNAL_THRESHOLD
-            && !inCooldown);
-        const candidateUpdate = {
-            doi: normalizedTargetDoi,
-            uniqueSourceCount: FieldValue.increment(1),
-            totalSeenCount: FieldValue.increment(1),
-            lastSeenAt: FieldValue.serverTimestamp(),
-            lastSourceDoi: normalizedSourceDoi,
-            relationTypes: FieldValue.arrayUnion(...normalizedRelationTypes)
-        };
-
-        if (!candidateDoc.exists || !candidate.firstSeenAt) {
-            candidateUpdate.firstSeenAt = FieldValue.serverTimestamp();
-        }
-        candidateUpdate.relationCounts = normalizedRelationTypes.reduce((relationCounts, relationType) => {
-            relationCounts[relationType] = FieldValue.increment(1);
-            return relationCounts;
-        }, {});
-        if (cachedHasMetadata) {
-            candidateUpdate.status = "cached";
-        } else if (shouldQueue) {
-            candidateUpdate.status = "queued";
-            candidateUpdate.queuedAt = FieldValue.serverTimestamp();
-        } else if (!candidate.status || candidate.status === "cached" || candidate.status === "enqueue-error") {
-            candidateUpdate.status = "candidate";
-        }
-
-        transaction.set(candidateRef, candidateUpdate, { merge: true });
-        transaction.set(observationRef, {
-            sourceDoi: normalizedSourceDoi,
-            targetDoi: normalizedTargetDoi,
-            relationTypes: normalizedRelationTypes,
-            createdAt: FieldValue.serverTimestamp()
-        });
-
-        return {
-            status: shouldQueue ? "queued" : (cachedHasMetadata ? "cached" : "candidate"),
-            shouldQueue: shouldQueue,
-            uniqueSourceCount: nextUniqueSourceCount,
-            targetDoi: normalizedTargetDoi
-        };
-    });
-};
-
+// Counts the source publication as one signal for each publication it references or is cited by,
+// and queues a prefetch for targets that reached the signal threshold. This happens once per
+// source (marked on its stored record), which is what makes the counts distinct sources.
 const recordPrefetchSignals = async ({ sourceDoi, data, context, logEntry }) => {
-    const normalizedSourceDoi = normalizeDoi(sourceDoi);
     const remainingSignals = Math.max(0, PREFETCH_MAX_SIGNALS_PER_REQUEST - context.signalCount);
-    const allTargets = getPrefetchTargetsByRelation(data)
-        .filter(target => target.doi !== normalizedSourceDoi);
+    const allTargets = getPrefetchTargetsByRelation(data).filter(target => target.doi !== sourceDoi);
     const targets = allTargets.slice(0, remainingSignals);
-    const summary = {
-        signalCount: targets.length,
-        queuedCount: 0,
-        candidateCount: 0,
-        cachedCount: 0,
-        duplicateCount: 0,
-        skippedCount: 0,
-        errorCount: 0,
-        enqueueErrorCount: 0
-    };
 
     if (targets.length === 0) {
-        if (remainingSignals === 0) {
+        if (allTargets.length > 0) {
             logEntry.prefetch = { signalCount: 0, budgetExhausted: true };
         }
         return;
     }
-
     context.signalCount += targets.length;
+
+    const candidates = await store.readPrefetchCandidates(targets.map(target => target.doi));
+    const cooldownStart = new Date(Date.now() - PREFETCH_REQUEUE_COOLDOWN_MS);
+    const isDue = index => {
+        const candidate = candidates[index] || {};
+        return !["suppressed", "cached", "fetched"].includes(candidate.status)
+            && (candidate.uniqueSourceCount || 0) + 1 >= PREFETCH_SIGNAL_THRESHOLD
+            && !(getLatestDate(candidate.queuedAt, candidate.fetchedAt, candidate.failedAt) > cooldownStart);
+    };
+    const dueDois = targets.filter((target, index) => isDue(index)).map(target => target.doi);
+    const dueEntries = await store.readPublicationEntries(dueDois);
+    const storedDois = new Set(dueDois.filter((doi, index) => hasMetadata(dueEntries[index]?.data)));
+
+    const signals = targets.map((target, index) => {
+        let status = candidates[index]?.status ? undefined : "candidate";
+        if (storedDois.has(target.doi)) {
+            status = "cached";
+        } else if (dueDois.includes(target.doi) && context.enqueueAttemptCount < PREFETCH_MAX_ENQUEUES_PER_REQUEST) {
+            context.enqueueAttemptCount++;
+            status = "queued";
+        }
+        return { doi: target.doi, relationTypes: target.relationTypes, status: status };
+    });
+    await store.writePrefetchSignals(sourceDoi, signals);
+
+    const summary = {
+        signalCount: signals.length,
+        queuedCount: 0,
+        candidateCount: signals.filter(signal => signal.status !== "queued" && signal.status !== "cached").length,
+        cachedCount: storedDois.size,
+        enqueueErrorCount: 0
+    };
     if (allTargets.length > targets.length) {
         summary.budgetExhausted = true;
     }
-
-    for (const target of targets) {
+    for (const signal of signals.filter(signal => signal.status === "queued")) {
         try {
-            const allowQueue = context.enqueueAttemptCount < PREFETCH_MAX_ENQUEUES_PER_REQUEST;
-            const result = await recordPrefetchCandidate({
-                sourceDoi: normalizedSourceDoi,
-                targetDoi: target.doi,
-                relationTypes: target.relationTypes,
-                allowQueue: allowQueue
-            });
-
-            if (result.status === "queued") {
-                context.enqueueAttemptCount++;
-                try {
-                    const task = await enqueuePrefetchTask({ doi: target.doi });
-                    await store.prefetchCandidateRef(target.doi).set({
-                        prefetchTask: task.name,
-                        lastEnqueuedAt: FieldValue.serverTimestamp()
-                    }, { merge: true });
-                    summary.queuedCount++;
-                } catch (error) {
-                    summary.enqueueErrorCount++;
-                    summary.lastError = String(error).slice(0, 500);
-                    await markPrefetchEnqueueError(target.doi, error);
-                }
-            } else if (result.status === "cached") {
-                summary.cachedCount++;
-            } else if (result.status === "already-observed") {
-                summary.duplicateCount++;
-            } else if (result.status === "skipped") {
-                summary.skippedCount++;
-            } else {
-                summary.candidateCount++;
-            }
+            await enqueuePrefetchTask({ doi: signal.doi });
+            summary.queuedCount++;
         } catch (error) {
-            summary.errorCount++;
+            summary.enqueueErrorCount++;
             summary.lastError = String(error).slice(0, 500);
+            await store.markPrefetchCandidate(signal.doi, {
+                status: "enqueue-error",
+                failedAt: new Date(),
+                lastError: summary.lastError
+            });
         }
     }
 
@@ -709,47 +621,31 @@ const recordPrefetchSignals = async ({ sourceDoi, data, context, logEntry }) => 
 
 const markPrefetchTaskComplete = async ({ doi, data, logEntry }) => {
     const fetched = hasMetadata(data);
-    const update = {
+    await store.markPrefetchCandidate(doi, {
         status: fetched ? "fetched" : "failed",
-        lastTaskFinishedAt: FieldValue.serverTimestamp(),
-        lastTaskHadMetadata: fetched
-    };
-
-    if (fetched) {
-        update.fetchedAt = FieldValue.serverTimestamp();
-    } else {
-        update.failedAt = FieldValue.serverTimestamp();
-    }
-
-    await store.prefetchCandidateRef(doi).set(update, { merge: true });
+        [fetched ? "fetchedAt" : "failedAt"]: new Date()
+    });
     logEntry.prefetchTask = fetched ? "fetched" : "failed";
 };
 
-const loadPublicationData = async ({ doi, refreshCache, noCache, collectPrefetchSignals, prefetchContext }) => {
+const loadPublicationData = async ({ doi, refreshCache, noCache }) => {
     const timeStart = new Date().getTime();
     const logEntry = { severity: "INFO", doi: doi };
     const bypassCache = noCache || refreshCache;
-    const activePrefetchContext = prefetchContext || { signalCount: 0, enqueueAttemptCount: 0 };
-    const maybeRecordPrefetchSignals = async data => {
-        if (!collectPrefetchSignals || !data) {
-            return;
-        }
-        await recordPrefetchSignals({
-            sourceDoi: doi,
-            data: data,
-            context: activePrefetchContext,
-            logEntry: logEntry
-        });
-    };
 
     const cachedEntry = await store.readPublicationEntry(doi);
     const cachedData = cachedEntry?.data;
     const cachedExpireAt = cachedEntry?.refreshAfter ?? cachedEntry?.expireAt;
+    const toResult = data => ({
+        data: data,
+        logEntry: logEntry,
+        timeStart: timeStart,
+        needsPrefetchSignals: hasMetadata(data) && !cachedEntry?.prefetchSignalsAt
+    });
 
     if (!bypassCache && cachedExpireAt > new Date()) {
         logEntry.tag = "cache-hit";
-        await maybeRecordPrefetchSignals(cachedData);
-        return { data: cachedData, logEntry: logEntry, timeStart: timeStart };
+        return toResult(cachedData);
     }
 
     if (!bypassCache && hasMetadata(cachedData)) {
@@ -763,13 +659,12 @@ const loadPublicationData = async ({ doi, refreshCache, noCache, collectPrefetch
             logEntry.refresh = "enqueue-error";
             logEntry.refreshError = String(error).slice(0, 500);
         }
-        await maybeRecordPrefetchSignals(cachedData);
-        return { data: cachedData, logEntry: logEntry, timeStart: timeStart };
+        return toResult(cachedData);
     }
 
     if (refreshCache && cachedExpireAt > new Date() && hasMetadata(cachedData)) {
         logEntry.tag = "cache-refresh-skipped";
-        return { data: cachedData, logEntry: logEntry, timeStart: timeStart };
+        return toResult(cachedData);
     }
 
     logEntry.tag = refreshCache ? "cache-refresh" : (noCache ? "cache-disabled" : (cachedEntry ? "cache-expired" : "cache-miss"));
@@ -777,9 +672,7 @@ const loadPublicationData = async ({ doi, refreshCache, noCache, collectPrefetch
         logEntry.cacheExpireAt = cachedExpireAt.toISOString();
     }
 
-    const data = await refreshPublicationData({ doi, cachedEntry, noCache, logEntry });
-    await maybeRecordPrefetchSignals(data);
-    return { data: data, logEntry: logEntry, timeStart: timeStart };
+    return toResult(await refreshPublicationData({ doi, cachedEntry, noCache, logEntry }));
 };
 
 const logRequest = (logEntry, data, timeStart) => {
@@ -788,44 +681,35 @@ const logRequest = (logEntry, data, timeStart) => {
     console.log(JSON.stringify(logEntry));
 };
 
-const processPrefetchSignalTask = async ({ dois, prefetchContext, dependencies = {} }) => {
-    const loadPublication = dependencies.loadPublicationData || loadPublicationData;
-    const recordSignals = dependencies.recordPrefetchSignals || recordPrefetchSignals;
-    const writeLog = dependencies.logRequest || logRequest;
-    const results = [];
+// Records the prefetch signals of stored publications that have not been counted as a source yet.
+const processPrefetchSignalTask = async ({ dois, prefetchContext }) => {
+    const entries = await store.readPublicationEntries(dois);
 
-    for (const doi of dois) {
-        const result = await loadPublication({
-            doi,
-            refreshCache: false,
-            noCache: false,
-            collectPrefetchSignals: false,
-            prefetchContext
-        });
-        result.logEntry.prefetchSignalTask = true;
-
-        if (result.data) {
-            await recordSignals({
-                sourceDoi: doi,
-                data: result.data,
-                context: prefetchContext,
-                logEntry: result.logEntry
-            });
+    for (const [index, doi] of dois.entries()) {
+        const entry = entries[index];
+        if (!hasMetadata(entry?.data) || entry.prefetchSignalsAt) {
+            continue;
         }
 
-        writeLog(result.logEntry, result.data, result.timeStart);
-        results.push(result.data);
+        const timeStart = new Date().getTime();
+        const logEntry = { severity: "INFO", doi: doi, tag: "prefetch-source" };
+        try {
+            await recordPrefetchSignals({ sourceDoi: doi, data: entry.data, context: prefetchContext, logEntry });
+        } catch (error) {
+            logEntry.prefetch = { signalCount: 0, errorCount: 1, lastError: String(error).slice(0, 500) };
+        }
+        if (logEntry.prefetch) {
+            logRequest(logEntry, entry.data, timeStart);
+        }
     }
-
-    return results;
 };
 
+// Resolves to the load results in the order of the DOIs.
 const loadBulkPublicationData = async ({
     dois,
     refreshCache,
     noCache,
     prefetch,
-    prefetchContext,
     dependencies = {}
 }) => {
     const loadPublication = dependencies.loadPublicationData || loadPublicationData;
@@ -833,14 +717,7 @@ const loadBulkPublicationData = async ({
     const writeLog = dependencies.logRequest || logRequest;
 
     const settledResults = await Promise.allSettled(dois.map(async doi => {
-        const result = await loadPublication({
-            doi,
-            refreshCache,
-            noCache,
-            collectPrefetchSignals: false,
-            prefetchContext
-        });
-
+        const result = await loadPublication({ doi, refreshCache, noCache });
 
         if (prefetch) {
             try {
@@ -852,7 +729,7 @@ const loadBulkPublicationData = async ({
         }
 
         writeLog(result.logEntry, result.data, result.timeStart);
-        return result.data;
+        return result;
     }));
     const rejectedResult = settledResults.find(result => result.status === "rejected");
 
@@ -948,15 +825,10 @@ functions.http('pure-publications', async (req, res) => {
     }
 
     if (isBulk) {
-        const results = await loadBulkPublicationData({
-            dois,
-            refreshCache,
-            noCache,
-            prefetch,
-            prefetchContext
-        });
-        const prefetchSignalTasks = collectPrefetchSignals
-            ? await enqueuePrefetchSignalTasks({ dois })
+        const results = await loadBulkPublicationData({ dois, refreshCache, noCache, prefetch });
+        const prefetchSignalDois = dois.filter((doi, index) => results[index].needsPrefetchSignals);
+        const prefetchSignalTasks = collectPrefetchSignals && prefetchSignalDois.length > 0
+            ? await enqueuePrefetchSignalTasks({ dois: prefetchSignalDois })
             : null;
         console.log(JSON.stringify({
             severity: "INFO",
@@ -967,17 +839,11 @@ functions.http('pure-publications', async (req, res) => {
             prefetchSignalTaskErrors: prefetchSignalTasks?.errorCount || undefined,
             processingTime: new Date().getTime() - timeStart
         }));
-        res.send(results);
+        res.send(results.map(result => result.data));
         return;
     }
 
-    const result = await loadPublicationData({
-        doi: dois[0],
-        refreshCache,
-        noCache,
-        collectPrefetchSignals: false,
-        prefetchContext
-    });
+    const result = await loadPublicationData({ doi: dois[0], refreshCache, noCache });
     if (prefetch) {
         try {
             await markPrefetchTaskComplete({ doi: dois[0], data: result.data, logEntry: result.logEntry });
@@ -986,7 +852,7 @@ functions.http('pure-publications', async (req, res) => {
             result.logEntry.prefetchTaskError = String(error).slice(0, 500);
         }
     }
-    if (collectPrefetchSignals) {
+    if (collectPrefetchSignals && result.needsPrefetchSignals) {
         result.logEntry.prefetchSignalTasks = await enqueuePrefetchSignalTasks({ dois: [dois[0]] });
     }
     logRequest(result.logEntry, result.data, result.timeStart);

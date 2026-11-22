@@ -83,7 +83,9 @@ Only entries without metadata (unknown DOIs) carry an `expireAt` date and are lo
 
 ## Prefetching
 
-Normal user-facing requests enqueue non-blocking prefetch signal tasks for both outgoing `reference` DOIs and incoming `citation` DOIs. A target DOI is counted once per distinct source publication, so repeated requests for the same source DOI do not inflate the signal. When the distinct-source count reaches `PREFETCH_SIGNAL_THRESHOLD`, the service enqueues a low-priority background fetch with `prefetch=true`.
+A publication that is requested for the first time is counted once as a signal for each of its outgoing `reference` DOIs and incoming `citation` DOIs. This happens in a background task; afterwards the stored record carries `prefetchSignalsAt`, and later requests for it cause no further bookkeeping. The counts are kept in the `prefetch-candidates` collection (one read and one write per target). When a target reaches `PREFETCH_SIGNAL_THRESHOLD` distinct sources and is not stored yet, the service enqueues a low-priority background fetch with `prefetch=true`.
+
+The former `prefetch-observations` collection is no longer used and can be deleted.
 
 Prefetch tasks write to the same `pure-publications` cache, but they do not record further prefetch signals. This prevents recursive citation/reference expansion. The deployment needs a Cloud Tasks queue named `pure-publications-prefetch` in addition to the existing refresh queue.
 

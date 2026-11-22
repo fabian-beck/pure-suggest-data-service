@@ -264,7 +264,7 @@ test('a record is served without provider requests until its refresh is due', as
 
     assert.equal(logEntry.tag, 'cache-hit');
     assert.deepEqual(data, stored.data);
-    assert.deepEqual(requests, []);
+    assert.equal(requests.length, 0);
 });
 
 test('a record from before the refresh schedule is served until its expiry date', async () => {
@@ -275,7 +275,7 @@ test('a record from before the refresh schedule is served until its expiry date'
     const { logEntry } = await loadPublicationData({ doi: DOI });
 
     assert.equal(logEntry.tag, 'cache-hit');
-    assert.deepEqual(requests, []);
+    assert.equal(requests.length, 0);
 });
 
 test('a record due for refresh is served as stored and queued for refresh', async () => {

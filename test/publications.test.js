@@ -12,7 +12,6 @@ const {
     hasMetadata,
     isTransientCrossrefStatus,
     loadBulkPublicationData,
-    processPrefetchSignalTask,
     mergeMetadata,
     normalizeDoi,
     parseDoiInput,
@@ -74,12 +73,9 @@ test('bulk publication loading starts DOI loads concurrently and preserves respo
         refreshCache: false,
         noCache: false,
         prefetch: false,
-        collectPrefetchSignals: false,
-        prefetchContext: { signalCount: 0, enqueueAttemptCount: 0 },
         dependencies: {
-            loadPublicationData: async ({ doi, collectPrefetchSignals }) => {
+            loadPublicationData: async ({ doi }) => {
                 started.push(doi);
-                assert.equal(collectPrefetchSignals, false);
                 return new Promise(resolve => pending.set(doi, () => resolve({
                     data: { doi },
                     logEntry: { doi },
@@ -98,40 +94,8 @@ test('bulk publication loading starts DOI loads concurrently and preserves respo
 
     const results = await bulkPromise;
 
-    assert.deepEqual(results, dois.map(doi => ({ doi })));
+    assert.deepEqual(results.map(result => result.data), dois.map(doi => ({ doi })));
     assert.deepEqual([...logged].sort(), [...dois].sort());
-});
-
-test('bulk publication loading does not record prefetch signals inline', async () => {
-    const prefetchContext = { signalCount: 0, enqueueAttemptCount: 0 };
-    const dois = ['10.a/one', '10.b/two'];
-    let recordedInline = false;
-
-    await loadBulkPublicationData({
-        dois,
-        refreshCache: false,
-        noCache: false,
-        prefetch: false,
-        collectPrefetchSignals: true,
-        prefetchContext,
-        dependencies: {
-            loadPublicationData: async ({ doi, collectPrefetchSignals }) => {
-                assert.equal(collectPrefetchSignals, false);
-                return {
-                    data: { doi },
-                    logEntry: { doi },
-                    timeStart: Date.now()
-                };
-            },
-            recordPrefetchSignals: async () => {
-                recordedInline = true;
-            },
-            logRequest: () => {}
-        }
-    });
-
-    assert.equal(recordedInline, false);
-    assert.deepEqual(prefetchContext, { signalCount: 0, enqueueAttemptCount: 0 });
 });
 
 test('prefetch signal recording is enqueued in DOI chunks', async () => {
@@ -159,43 +123,6 @@ test('prefetch signal recording is enqueued in DOI chunks', async () => {
     assert.equal(firstUrl.searchParams.get('recordPrefetchSignals'), 'true');
     assert.equal(firstUrl.searchParams.get('dois').split(',').length, 10);
     assert.deepEqual(secondUrl.searchParams.get('dois').split(','), ['10.test/10']);
-});
-
-test('prefetch signal task records signals outside the user request path', async () => {
-    const prefetchContext = { signalCount: 0, enqueueAttemptCount: 0 };
-    const dois = ['10.a/one', '10.b/two'];
-    const recorded = [];
-    const logged = [];
-
-    const results = await processPrefetchSignalTask({
-        dois,
-        prefetchContext,
-        dependencies: {
-            loadPublicationData: async ({ doi, refreshCache, noCache, collectPrefetchSignals, prefetchContext: context }) => {
-                assert.equal(refreshCache, false);
-                assert.equal(noCache, false);
-                assert.equal(collectPrefetchSignals, false);
-                assert.equal(context, prefetchContext);
-                return {
-                    data: { doi },
-                    logEntry: { doi },
-                    timeStart: Date.now()
-                };
-            },
-            recordPrefetchSignals: async ({ sourceDoi, context, logEntry }) => {
-                assert.equal(context, prefetchContext);
-                assert.equal(logEntry.prefetchSignalTask, true);
-                recorded.push(sourceDoi);
-                context.signalCount++;
-            },
-            logRequest: (logEntry, data) => logged.push({ doi: data.doi, task: logEntry.prefetchSignalTask })
-        }
-    });
-
-    assert.deepEqual(results, dois.map(doi => ({ doi })));
-    assert.deepEqual(recorded, dois);
-    assert.deepEqual(logged, dois.map(doi => ({ doi, task: true })));
-    assert.equal(prefetchContext.signalCount, 2);
 });
 
 test('detects metadata and transient Crossref statuses', () => {
