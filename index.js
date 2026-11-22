@@ -10,7 +10,9 @@ const { firestore, FieldValue, normalizeDoi, toDoiDocId } = store;
 const CROSSREF_BACKOFF_MS = 5 * 60 * 1000;
 const CROSSREF_USER_AGENT = "pure-suggest-data-service/0.0.1 (mailto:fabian.beck@uni-bamberg.de)";
 const PROVIDER_FETCH_TIMEOUT_MS = Number(process.env.PROVIDER_FETCH_TIMEOUT_MS || 10 * 1000);
-const OPENCITATIONS_ACCESS_TOKEN = "aa9da96d-3c7b-49c1-a2d8-1c2d01ae10a5";
+const OPENCITATIONS_HEADERS = process.env.OPENCITATIONS_ACCESS_TOKEN
+    ? { authorization: process.env.OPENCITATIONS_ACCESS_TOKEN }
+    : undefined;
 const OPENALEX_API_KEY = process.env.OPENALEX_API_KEY;
 const CLOUD_REGION = "europe-west1";
 const PROJECT_ID = process.env.GCP_PROJECT || process.env.GCLOUD_PROJECT || "pure-suggest-data-service";
@@ -243,9 +245,7 @@ const fetchDataCite = async (doi, logEntry) => {
 const fetchOpenCitationsMeta = async (doi, logEntry) => {
     const openCitationsMeta = await fetchJson({
         url: `https://api.opencitations.net/meta/v1/metadata/doi:${doi}`,
-        headers: {
-            authorization: OPENCITATIONS_ACCESS_TOKEN,
-        },
+        headers: OPENCITATIONS_HEADERS,
         logEntry: logEntry,
         logKey: "openCitationsMeta"
     });
@@ -353,9 +353,7 @@ const addOpenCitations = async (doi, data, tooManyCitations, logEntry) => {
         data.citation = "";
         const citations = await fetchJson({
             url: `https://opencitations.net/index/api/v2/citations/doi:${doi}`,
-            headers: {
-                authorization: OPENCITATIONS_ACCESS_TOKEN,
-            },
+            headers: OPENCITATIONS_HEADERS,
             logEntry: logEntry,
             logKey: "openCitations",
             statusField: "statusCitations"
@@ -896,8 +894,6 @@ const logUnhandledRequestError = (req, error, timeStart) => console.error(JSON.s
     processingTime: new Date().getTime() - timeStart
 }));
 
-// Retrieve aggregated data from Crossref (or DataCite) and OpenCitations
-// deploy with: "gcloud functions deploy pure-publications --gen2 --runtime=nodejs24 --region=europe-west1 --source=. --entry-point=pure-publications --trigger-http --allow-unauthenticated"
 functions.http('pure-publications', async (req, res) => {
     const timeStart = new Date().getTime();
 

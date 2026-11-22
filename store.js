@@ -1,9 +1,7 @@
 'use strict';
 
-const admin = require('firebase-admin');
-admin.initializeApp();
-const firestore = admin.firestore();
-const FieldValue = admin.firestore.FieldValue;
+const { Firestore, FieldValue } = require('@google-cloud/firestore');
+const firestore = new Firestore();
 
 const normalizeDoi = doi => String(doi ?? "").trim().toLowerCase();
 const toDoiDocId = doi => normalizeDoi(doi).replace(/\//g, '\\');
