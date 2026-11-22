@@ -126,3 +126,14 @@ test('rewriting a record replaces its fields but keeps the prefetch marker', { s
     assert.ok(entry.prefetchSignalsAt instanceof Date);
     assert.deepEqual(Object.keys(entry).sort(), ['data', 'prefetchSignalsAt', 'source']);
 });
+
+test('a Crossref backoff is stored and known without reading it again', { skip }, async () => {
+    const backoffUntil = new Date(Date.now() + 60 * 60 * 1000);
+
+    await store.writeCrossrefBackoff({ backoffUntil, status: 429 });
+    const known = await store.readCrossrefBackoffUntil();
+    await store.writeCrossrefBackoff({ backoffUntil: new Date(0), status: 200 });
+
+    assert.deepEqual(known, backoffUntil);
+    assert.deepEqual(await store.readCrossrefBackoffUntil(), new Date(0));
+});

@@ -65,6 +65,8 @@ Each DOI has one record in the `pure-publications` Firestore collection (accesse
 - While Crossref is unavailable, a stored record is kept as is (only its citations are updated) and Crossref is retried after 15 minutes.
 - If the citation lookup fails, the stored citations are kept and the record is refreshed again after a day.
 
+At most three Crossref requests are in flight per instance (`CROSSREF_MAX_CONCURRENT`); further lookups of a bulk request wait for a free slot, so many new DOIs at once do not run into Crossref's limit on concurrent requests.
+
 `noCache=true` forces such a refresh for the requested DOIs, including the metadata; the response is the merged record.
 
 ### Refresh schedule
