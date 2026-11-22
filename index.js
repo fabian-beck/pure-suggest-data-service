@@ -4,10 +4,8 @@
 const crypto = require('crypto');
 const functions = require('@google-cloud/functions-framework');
 
-const firebaseFunctions = require('firebase-functions');
-const admin = require('firebase-admin');
-admin.initializeApp();
-const firestore = admin.firestore();
+const store = require('./store');
+const { firestore, FieldValue, normalizeDoi, toDoiDocId } = store;
 
 const CROSSREF_BACKOFF_MS = 5 * 60 * 1000;
 const CROSSREF_USER_AGENT = "pure-suggest-data-service/0.0.1 (mailto:fabian.beck@uni-bamberg.de)";
@@ -27,11 +25,19 @@ const PREFETCH_MAX_ENQUEUES_PER_REQUEST = Number(process.env.PREFETCH_MAX_ENQUEU
 const PREFETCH_REQUEUE_COOLDOWN_MS = Number(process.env.PREFETCH_REQUEUE_COOLDOWN_MS || 24 * 60 * 60 * 1000);
 const PREFETCH_SIGNAL_TASK_DOIS_PER_REQUEST = Math.max(1, Number(process.env.PREFETCH_SIGNAL_TASK_DOIS_PER_REQUEST || 10));
 
+// Citation lists are only loaded for publications with fewer citations
+const MAX_CITATIONS = 1000;
+// Metadata sources, best first
+const METADATA_SOURCES = ["Crossref", "OpenCitations Meta", "OpenAlex", "DataCite"];
+
+const getSourceRank = source => {
+    const rank = METADATA_SOURCES.indexOf(source);
+    return rank === -1 ? METADATA_SOURCES.length : rank;
+};
+
 const isTransientCrossrefStatus = status => status === 429 || (status >= 500 && status < 600) || status === "backoff" || status === "error" || status === "timeout";
 const hasMetadata = entry => Boolean(entry?.title || entry?.author || entry?.container || entry?.abstract);
 
-const normalizeDoi = doi => String(doi ?? "").trim().toLowerCase();
-const toDoiDocId = doi => normalizeDoi(doi).replace(/\//g, '\\');
 const isTruthyFlag = value => value === true || value === "true";
 
 const parseDoiInput = (value, splitStrings = false) => {
@@ -95,9 +101,6 @@ const getDoiRequestInput = req => {
 const hashPrefetchObservationId = (sourceDoi, targetDoi) =>
     crypto.createHash("sha256").update(`${sourceDoi}\0${targetDoi}`).digest("hex");
 
-const getPublicationRef = doi => firestore.collection('pure-publications').doc(toDoiDocId(doi));
-const getPrefetchCandidateRef = doi => firestore.collection('prefetch-candidates').doc(toDoiDocId(doi));
-
 const getPrefetchTargetsByRelation = data => {
     const relationTargets = {
         reference: parseDoiInput(data?.reference, true).slice(0, PREFETCH_MAX_DOIS_PER_RELATION),
@@ -145,9 +148,9 @@ const getCrossrefBackoffUntil = response => {
     return new Date(Date.now() + CROSSREF_BACKOFF_MS);
 };
 
-const getCacheExpireDate = crossrefStatus => {
+const getCacheExpireDate = isComplete => {
     const expireDate = new Date();
-    expireDate.setDate(expireDate.getDate() + (crossrefStatus === 200 ? 30 : 1));
+    expireDate.setDate(expireDate.getDate() + (isComplete ? 30 : 1));
     return expireDate;
 };
 
@@ -186,9 +189,7 @@ const getShortRetryExpireDate = () => {
 };
 
 const fetchCrossref = async (doi, logEntry) => {
-    const crossrefStateRef = firestore.collection("service-state").doc("crossref");
-    const crossrefStateDoc = await crossrefStateRef.get();
-    const crossrefBackoffUntil = crossrefStateDoc.data()?.backoffUntil?.toDate?.();
+    const crossrefBackoffUntil = await store.readCrossrefBackoffUntil();
 
     if (crossrefBackoffUntil > new Date()) {
         logEntry.crossref = {
@@ -213,14 +214,13 @@ const fetchCrossref = async (doi, logEntry) => {
         const backoffUntil = getCrossrefBackoffUntil(crossref.response);
         const crossrefStateUpdate = {
             backoffUntil: backoffUntil,
-            status: crossref.status,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            status: crossref.status
         };
         logEntry.crossref.backoffUntil = backoffUntil.toISOString();
         if (crossref.error) {
             crossrefStateUpdate.error = String(crossref.error).slice(0, 500);
         }
-        await crossrefStateRef.set(crossrefStateUpdate, { merge: true });
+        await store.writeCrossrefBackoff(crossrefStateUpdate);
     }
 
     return { status: crossref.status, data: dataCrossref, transientFailure: transientFailure };
@@ -342,9 +342,9 @@ const mergeMetadata = (doi, dataCrossref, dataDataCite, dataOpenCitationsMeta, d
     return data;
 };
 
-const addOpenCitations = async (doi, data, dataCrossref, logEntry) => {
-    // if not too many citations (is-referenced-by-count)
-    if (!dataCrossref || dataCrossref["is-referenced-by-count"] < 1000) {
+// Returns whether the citation data is up to date afterwards.
+const addOpenCitations = async (doi, data, tooManyCitations, logEntry) => {
+    if (!tooManyCitations) {
         data.citation = "";
         const citations = await fetchJson({
             url: `https://opencitations.net/index/api/v2/citations/doi:${doi}`,
@@ -362,26 +362,49 @@ const addOpenCitations = async (doi, data, dataCrossref, logEntry) => {
                 data.citation += doi + "; ";
             }
         });
-    } else {
-        data.tooManyCitations = true;
+        return citations.status === 200;
     }
+    data.tooManyCitations = true;
+    return true;
 };
 
-const refreshPublicationData = async ({ doi, doiRef, cachedEntry, noCache, logEntry }) => {
-    const cachedData = cachedEntry?.data;
+// Fresh values replace stored ones only when they come from an equal or better source;
+// either way, a field one side lacks is filled from the other, so stored records never lose data.
+const mergeWithStoredData = (data, source, storedEntry) => {
+    const storedData = storedEntry.data;
+    const storedSource = storedEntry.source || "unknown";
+    const freshWins = source !== "none" && getSourceRank(source) <= getSourceRank(storedSource);
+    const merged = freshWins ? { ...storedData, ...data } : { ...data, ...storedData };
+
+    if (data.citation) {
+        merged.citation = data.citation;
+    }
+    if (data.tooManyCitations) {
+        merged.tooManyCitations = true;
+    } else {
+        delete merged.tooManyCitations;
+    }
+
+    return { data: merged, source: freshWins ? source : storedSource };
+};
+
+const refreshPublicationData = async ({ doi, cachedEntry, logEntry }) => {
+    const storedData = hasMetadata(cachedEntry?.data) ? cachedEntry.data : null;
     const crossref = await fetchCrossref(doi, logEntry);
     const dataCrossref = crossref.data;
+    // A stored record bridges a Crossref outage, so the weaker fallback sources are not needed then
+    const useFallbacks = !dataCrossref && !(crossref.transientFailure && storedData);
     let dataOpenCitationsMeta = null;
     let dataOpenAlex = null;
     let dataDataCite = null;
 
-    if (!dataCrossref) {
+    if (useFallbacks) {
         dataOpenCitationsMeta = await fetchOpenCitationsMeta(doi, logEntry);
     }
-    if (!dataCrossref && !hasMetadata(dataOpenCitationsMeta)) {
+    if (useFallbacks && !hasMetadata(dataOpenCitationsMeta)) {
         dataOpenAlex = await fetchOpenAlex(doi, logEntry);
     }
-    if (!dataCrossref && !hasMetadata(dataOpenCitationsMeta) && !hasMetadata(dataOpenAlex)) {
+    if (useFallbacks && !hasMetadata(dataOpenCitationsMeta) && !hasMetadata(dataOpenAlex)) {
         dataDataCite = await fetchDataCite(doi, logEntry);
     }
 
@@ -400,21 +423,36 @@ const refreshPublicationData = async ({ doi, doiRef, cachedEntry, noCache, logEn
         return { error: "Error processing metadata: " + error };
     }
 
-    await addOpenCitations(doi, data, dataCrossref, logEntry);
+    const tooManyCitations = dataCrossref
+        ? dataCrossref["is-referenced-by-count"] >= MAX_CITATIONS
+        : Boolean(storedData?.tooManyCitations);
+    const citationsUpToDate = await addOpenCitations(doi, data, tooManyCitations, logEntry);
 
     // remove undefined/empty properties from data
     Object.keys(data).forEach(key => (data[key] === undefined || data[key] === '') && delete data[key]);
 
-    if (!noCache && crossref.transientFailure && !hasMetadata(data) && hasMetadata(cachedData)) {
-        logEntry.cacheWrite = "preserved-stale";
-        data = cachedData;
-        await doiRef.set({ expireAt: getShortRetryExpireDate(), data: data, source: cachedEntry.source || "stale" });
-    } else if (crossref.transientFailure && !hasMetadata(data)) {
-        logEntry.cacheWrite = "skipped-transient-crossref-failure";
-    } else {
-        logEntry.cacheWrite = "stored";
-        await doiRef.set({ expireAt: getCacheExpireDate(hasMetadata(data) ? 200 : crossref.status), data: data, source: metadataSource });
+    let source = metadataSource;
+    if (storedData) {
+        const keptStoredFields = Object.keys(storedData).filter(key => data[key] === undefined);
+        if (keptStoredFields.length > 0) {
+            logEntry.keptStoredFields = keptStoredFields;
+        }
+        ({ data, source } = mergeWithStoredData(data, metadataSource, cachedEntry));
     }
+
+    if (crossref.transientFailure && !hasMetadata(data)) {
+        logEntry.cacheWrite = "skipped-transient-crossref-failure";
+        return data;
+    }
+
+    logEntry.cacheWrite = crossref.transientFailure && storedData ? "preserved-stale" : "stored";
+    await store.writePublicationEntry(doi, {
+        expireAt: crossref.transientFailure
+            ? getShortRetryExpireDate()
+            : getCacheExpireDate(hasMetadata(data) && citationsUpToDate),
+        data: data,
+        source: source
+    });
 
     return data;
 };
@@ -457,8 +495,8 @@ const enqueueHttpTask = async ({ queue, url }) => {
     return response.json();
 };
 
-const enqueueRefreshTask = async ({ doi, doiRef, cachedEntry, logEntry }) => {
-    const refreshQueuedAt = cachedEntry?.refreshQueuedAt?.toDate?.();
+const enqueueRefreshTask = async ({ doi, cachedEntry, logEntry }) => {
+    const refreshQueuedAt = cachedEntry?.refreshQueuedAt;
     if (refreshQueuedAt && refreshQueuedAt > new Date(Date.now() - 60 * 1000)) {
         logEntry.refresh = "already-queued";
         logEntry.refreshQueuedAt = refreshQueuedAt.toISOString();
@@ -467,7 +505,7 @@ const enqueueRefreshTask = async ({ doi, doiRef, cachedEntry, logEntry }) => {
 
     const refreshUrl = `${FUNCTION_URL}?doi=${encodeURIComponent(doi)}&refreshCache=true`;
     const task = await enqueueHttpTask({ queue: REFRESH_QUEUE, url: refreshUrl });
-    await doiRef.set({ refreshQueuedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    await store.markRefreshQueued(doi);
     logEntry.refresh = "queued";
     logEntry.refreshTask = task.name;
 };
@@ -499,9 +537,9 @@ const enqueuePrefetchSignalTasks = async ({ dois, dependencies = {} }) => {
 };
 
 const markPrefetchEnqueueError = async (doi, error) => {
-    await getPrefetchCandidateRef(doi).set({
+    await store.prefetchCandidateRef(doi).set({
         status: "enqueue-error",
-        failedAt: admin.firestore.FieldValue.serverTimestamp(),
+        failedAt: FieldValue.serverTimestamp(),
         lastError: String(error).slice(0, 500)
     }, { merge: true });
 };
@@ -517,8 +555,8 @@ const recordPrefetchCandidate = async ({ sourceDoi, targetDoi, relationTypes, al
 
     const observationRef = firestore.collection('prefetch-observations')
         .doc(hashPrefetchObservationId(normalizedSourceDoi, normalizedTargetDoi));
-    const candidateRef = getPrefetchCandidateRef(normalizedTargetDoi);
-    const publicationRef = getPublicationRef(normalizedTargetDoi);
+    const candidateRef = store.prefetchCandidateRef(normalizedTargetDoi);
+    const publicationRef = store.publicationRef(normalizedTargetDoi);
 
     return firestore.runTransaction(async transaction => {
         const observationDoc = await transaction.get(observationRef);
@@ -541,25 +579,25 @@ const recordPrefetchCandidate = async ({ sourceDoi, targetDoi, relationTypes, al
             && !inCooldown);
         const candidateUpdate = {
             doi: normalizedTargetDoi,
-            uniqueSourceCount: admin.firestore.FieldValue.increment(1),
-            totalSeenCount: admin.firestore.FieldValue.increment(1),
-            lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+            uniqueSourceCount: FieldValue.increment(1),
+            totalSeenCount: FieldValue.increment(1),
+            lastSeenAt: FieldValue.serverTimestamp(),
             lastSourceDoi: normalizedSourceDoi,
-            relationTypes: admin.firestore.FieldValue.arrayUnion(...normalizedRelationTypes)
+            relationTypes: FieldValue.arrayUnion(...normalizedRelationTypes)
         };
 
         if (!candidateDoc.exists || !candidate.firstSeenAt) {
-            candidateUpdate.firstSeenAt = admin.firestore.FieldValue.serverTimestamp();
+            candidateUpdate.firstSeenAt = FieldValue.serverTimestamp();
         }
         candidateUpdate.relationCounts = normalizedRelationTypes.reduce((relationCounts, relationType) => {
-            relationCounts[relationType] = admin.firestore.FieldValue.increment(1);
+            relationCounts[relationType] = FieldValue.increment(1);
             return relationCounts;
         }, {});
         if (cachedHasMetadata) {
             candidateUpdate.status = "cached";
         } else if (shouldQueue) {
             candidateUpdate.status = "queued";
-            candidateUpdate.queuedAt = admin.firestore.FieldValue.serverTimestamp();
+            candidateUpdate.queuedAt = FieldValue.serverTimestamp();
         } else if (!candidate.status || candidate.status === "cached" || candidate.status === "enqueue-error") {
             candidateUpdate.status = "candidate";
         }
@@ -569,7 +607,7 @@ const recordPrefetchCandidate = async ({ sourceDoi, targetDoi, relationTypes, al
             sourceDoi: normalizedSourceDoi,
             targetDoi: normalizedTargetDoi,
             relationTypes: normalizedRelationTypes,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
+            createdAt: FieldValue.serverTimestamp()
         });
 
         return {
@@ -624,9 +662,9 @@ const recordPrefetchSignals = async ({ sourceDoi, data, context, logEntry }) => 
                 context.enqueueAttemptCount++;
                 try {
                     const task = await enqueuePrefetchTask({ doi: target.doi });
-                    await getPrefetchCandidateRef(target.doi).set({
+                    await store.prefetchCandidateRef(target.doi).set({
                         prefetchTask: task.name,
-                        lastEnqueuedAt: admin.firestore.FieldValue.serverTimestamp()
+                        lastEnqueuedAt: FieldValue.serverTimestamp()
                     }, { merge: true });
                     summary.queuedCount++;
                 } catch (error) {
@@ -656,17 +694,17 @@ const markPrefetchTaskComplete = async ({ doi, data, logEntry }) => {
     const fetched = hasMetadata(data);
     const update = {
         status: fetched ? "fetched" : "failed",
-        lastTaskFinishedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastTaskFinishedAt: FieldValue.serverTimestamp(),
         lastTaskHadMetadata: fetched
     };
 
     if (fetched) {
-        update.fetchedAt = admin.firestore.FieldValue.serverTimestamp();
+        update.fetchedAt = FieldValue.serverTimestamp();
     } else {
-        update.failedAt = admin.firestore.FieldValue.serverTimestamp();
+        update.failedAt = FieldValue.serverTimestamp();
     }
 
-    await getPrefetchCandidateRef(doi).set(update, { merge: true });
+    await store.prefetchCandidateRef(doi).set(update, { merge: true });
     logEntry.prefetchTask = fetched ? "fetched" : "failed";
 };
 
@@ -687,11 +725,9 @@ const loadPublicationData = async ({ doi, refreshCache, noCache, collectPrefetch
         });
     };
 
-    const doiRef = getPublicationRef(doi);
-    const doiDoc = await doiRef.get();
-    const cachedEntry = doiDoc.exists ? doiDoc.data() : null;
+    const cachedEntry = await store.readPublicationEntry(doi);
     const cachedData = cachedEntry?.data;
-    const cachedExpireAt = cachedEntry?.expireAt?.toDate?.();
+    const cachedExpireAt = cachedEntry?.expireAt;
 
     if (!bypassCache && cachedExpireAt > new Date()) {
         logEntry.tag = "cache-hit";
@@ -705,7 +741,7 @@ const loadPublicationData = async ({ doi, refreshCache, noCache, collectPrefetch
             logEntry.cacheExpireAt = cachedExpireAt.toISOString();
         }
         try {
-            await enqueueRefreshTask({ doi, doiRef, cachedEntry, logEntry });
+            await enqueueRefreshTask({ doi, cachedEntry, logEntry });
         } catch (error) {
             logEntry.refresh = "enqueue-error";
             logEntry.refreshError = String(error).slice(0, 500);
@@ -724,7 +760,7 @@ const loadPublicationData = async ({ doi, refreshCache, noCache, collectPrefetch
         logEntry.cacheExpireAt = cachedExpireAt.toISOString();
     }
 
-    const data = await refreshPublicationData({ doi, doiRef, cachedEntry, noCache, logEntry });
+    const data = await refreshPublicationData({ doi, cachedEntry, logEntry });
     await maybeRecordPrefetchSignals(data);
     return { data: data, logEntry: logEntry, timeStart: timeStart };
 };
@@ -961,5 +997,6 @@ module.exports.__test = {
     mergeMetadata,
     normalizeDoi,
     parseDoiInput,
+    refreshPublicationData,
     toDoiDocId
 };

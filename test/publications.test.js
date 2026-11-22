@@ -327,8 +327,9 @@ test('OpenCitations enrichment fails soft when fetch terminates', async () => {
     const data = { doi: '10.1234/example' };
     const logEntry = {};
 
-    await addOpenCitations('10.1234/example', data, { 'is-referenced-by-count': 0 }, logEntry);
+    const upToDate = await addOpenCitations('10.1234/example', data, false, logEntry);
 
+    assert.equal(upToDate, false);
     assert.equal(data.citation, '');
     assert.equal(logEntry.openCitations.statusCitations, 'error');
     assert.match(logEntry.openCitations.error, /terminated/);
