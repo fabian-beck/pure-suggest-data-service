@@ -4,15 +4,16 @@
   "description": "Providing data to PURE suggest",
   "main": "index.js",
   "scripts": {
-    "start": "npx functions-framework --target=doidata --signature-type=http",
-    "test": "node --test --test-isolation=none"
+    "start": "functions-framework --target=pure-publications --signature-type=http",
+    "test": "node --test --test-isolation=none",
+    "test:emulator": "npx firebase-tools emulators:exec --only firestore --project demo-pure \"npm test\"",
+    "deploy": "gcloud functions deploy pure-publications --gen2 --runtime=nodejs24 --region=europe-west1 --source=. --entry-point=pure-publications --trigger-http --allow-unauthenticated"
   },
   "author": "Fabian Beck",
   "license": "MIT",
   "dependencies": {
-    "@google-cloud/functions-framework": "^3.1.0",
-    "firebase-admin": "^11.4.1",
-    "firebase-functions": "^4.1.1"
+    "@google-cloud/firestore": "^9.4.1",
+    "@google-cloud/functions-framework": "^5.0.5"
   },
   "engines": {
     "node": "24"

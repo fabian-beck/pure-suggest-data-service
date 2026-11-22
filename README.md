@@ -2,12 +2,29 @@
 
 Backend functions for PURE suggest to provide publications data
  
-## Project seutp
+## Project setup
 
 ```
 npm install
 gcloud init
 ```
+
+## Deployment
+
+```
+npm run deploy
+```
+
+The function runs on Node.js 24 in `europe-west1` and needs:
+
+- the Cloud Tasks queues `pure-publications-refresh` and `pure-publications-prefetch` in the same region; their dispatch rates limit how fast background lookups reach the providers
+- the environment variables `OPENCITATIONS_ACCESS_TOKEN` and `OPENALEX_API_KEY` (both optional; without them OpenCitations is asked without a token and OpenAlex is skipped). Set them once, later deployments keep them:
+
+```
+gcloud functions deploy pure-publications --gen2 --region=europe-west1 --update-env-vars OPENCITATIONS_ACCESS_TOKEN=...
+```
+
+`npm start` runs the function locally with the Functions Framework.
 
 ## Tests
 
