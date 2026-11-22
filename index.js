@@ -7,6 +7,7 @@ const store = require('./store');
 const { normalizeDoi, toDoiDocId } = store;
 
 const CROSSREF_BACKOFF_MS = 5 * 60 * 1000;
+const CROSSREF_MAX_CONCURRENT = 3;
 const CROSSREF_USER_AGENT = "pure-suggest-data-service/0.0.1 (mailto:fabian.beck@uni-bamberg.de)";
 const PROVIDER_FETCH_TIMEOUT_MS = Number(process.env.PROVIDER_FETCH_TIMEOUT_MS || 10 * 1000);
 const OPENCITATIONS_HEADERS = process.env.OPENCITATIONS_ACCESS_TOKEN
@@ -190,7 +191,31 @@ const fetchJson = async ({ url, headers, logEntry, logKey, statusField = "status
     }
 };
 
-const fetchCrossref = async (doi, logEntry) => {
+// Crossref only accepts a few concurrent requests per client, so further ones wait for a free slot
+// instead of running into its rate limit, which would put the service into backoff.
+let crossrefRequestCount = 0;
+const crossrefWaiting = [];
+
+const withCrossrefSlot = async request => {
+    if (crossrefRequestCount < CROSSREF_MAX_CONCURRENT) {
+        crossrefRequestCount++;
+    } else {
+        await new Promise(resolve => crossrefWaiting.push(resolve));
+    }
+    try {
+        return await request();
+    } finally {
+        // A waiting request takes over the slot directly
+        const next = crossrefWaiting.shift();
+        if (next) {
+            next();
+        } else {
+            crossrefRequestCount--;
+        }
+    }
+};
+
+const fetchCrossref = (doi, logEntry) => withCrossrefSlot(async () => {
     const crossrefBackoffUntil = await store.readCrossrefBackoffUntil();
 
     if (crossrefBackoffUntil > new Date()) {
@@ -226,7 +251,7 @@ const fetchCrossref = async (doi, logEntry) => {
     }
 
     return { status: crossref.status, data: dataCrossref, transientFailure: transientFailure };
-};
+});
 
 const fetchDataCite = async (doi, logEntry) => {
     const dataCite = await fetchJson({

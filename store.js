@@ -3,6 +3,7 @@
 const { Firestore, FieldValue } = require('@google-cloud/firestore');
 const firestore = new Firestore();
 
+const CROSSREF_BACKOFF_RECHECK_MS = 10 * 1000;
 const PUBLICATION_FIELDS = ['data', 'source', 'metadataFetchedAt', 'citationsFetchedAt', 'refreshAfter', 'expireAt', 'refreshQueuedAt'];
 
 const normalizeDoi = doi => String(doi ?? "").trim().toLowerCase();
@@ -33,10 +34,24 @@ const writePublicationEntry = (doi, entry) => publicationRef(doi).set(
 const markRefreshQueued = doi => publicationRef(doi)
     .set({ refreshQueuedAt: FieldValue.serverTimestamp() }, { merge: true });
 
-const readCrossrefBackoffUntil = async () => (await crossrefStateRef.get()).data()?.backoffUntil?.toDate?.();
+// The Crossref backoff is shared by all instances through Firestore; each instance
+// re-reads it at most every few seconds and not at all while a known backoff lasts.
+let crossrefBackoff = { until: undefined, readAt: 0 };
 
-const writeCrossrefBackoff = state => crossrefStateRef
-    .set({ ...state, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+const readCrossrefBackoffUntil = async () => {
+    if (!(crossrefBackoff.until > new Date()) && Date.now() - crossrefBackoff.readAt > CROSSREF_BACKOFF_RECHECK_MS) {
+        crossrefBackoff = {
+            until: (await crossrefStateRef.get()).data()?.backoffUntil?.toDate?.(),
+            readAt: Date.now()
+        };
+    }
+    return crossrefBackoff.until;
+};
+
+const writeCrossrefBackoff = state => {
+    crossrefBackoff = { until: state.backoffUntil, readAt: Date.now() };
+    return crossrefStateRef.set({ ...state, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+};
 
 const readPrefetchCandidates = dois => readAll(dois.map(prefetchCandidateRef));
 
