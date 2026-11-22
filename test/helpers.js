@@ -74,7 +74,8 @@ const cloudTasksRoutes = { [CLOUD_TASKS.token]: { access_token: "token" }, [CLOU
 const PROVIDER = {
     crossref: "api.crossref.org",
     openCitationsMeta: "opencitations.net/meta",
-    citations: "opencitations.net/index",
+    citations: "/citations/doi:",
+    references: "/references/doi:",
     openAlex: "api.openalex.org",
     dataCite: "api.datacite.org"
 };
