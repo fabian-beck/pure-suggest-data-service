@@ -13,7 +13,6 @@ const PROVIDER_FETCH_TIMEOUT_MS = Number(process.env.PROVIDER_FETCH_TIMEOUT_MS |
 const OPENCITATIONS_HEADERS = process.env.OPENCITATIONS_ACCESS_TOKEN
     ? { authorization: process.env.OPENCITATIONS_ACCESS_TOKEN }
     : undefined;
-const OPENALEX_API_KEY = process.env.OPENALEX_API_KEY;
 const CLOUD_REGION = "europe-west1";
 const PROJECT_ID = process.env.GCP_PROJECT || process.env.GCLOUD_PROJECT || "pure-suggest-data-service";
 const REFRESH_QUEUE = "pure-publications-refresh";
@@ -272,7 +271,22 @@ const fetchOpenCitationsMeta = async (doi, logEntry) => {
     return openCitationsMeta.data?.[0] || null;
 };
 
+// The outgoing references that OpenCitations knows, as "; "-separated DOIs
+const fetchOpenCitationsReferences = async (doi, logEntry) => {
+    const references = await fetchJson({
+        url: `https://opencitations.net/index/api/v2/references/doi:${doi}`,
+        headers: OPENCITATIONS_HEADERS,
+        logEntry: logEntry,
+        logKey: "openCitationsReferences"
+    });
+    return (Array.isArray(references.data) ? references.data : [])
+        .map(reference => reference.cited?.match(/doi:(\S+)/i)?.[1])
+        .filter(Boolean)
+        .join("; ");
+};
+
 const fetchOpenAlex = async (doi, logEntry) => {
+    const OPENALEX_API_KEY = process.env.OPENALEX_API_KEY;
     if (!OPENALEX_API_KEY) {
         logEntry.openAlex = { status: "skipped", reason: "missing-api-key" };
         return null;
@@ -442,6 +456,19 @@ const refreshPublicationData = async ({ doi, cachedEntry, noCache, logEntry }) =
 
     logEntry.metadataSource = metadataDue ? metadataSource : "stored";
 
+    // The citations and the fields the metadata source lacks are looked up side by side
+    const tooManyCitations = dataCrossref
+        ? dataCrossref["is-referenced-by-count"] >= MAX_CITATIONS
+        : Boolean(storedData?.tooManyCitations);
+    const citationData = {};
+    const citationsLookup = addOpenCitations(doi, citationData, tooManyCitations, logEntry);
+    const lacksReferences = metadataDue && (metadataSource !== "none" || storedData)
+        && !dataCrossref?.reference?.some(reference => reference.DOI) && !storedData?.reference;
+    const referencesLookup = lacksReferences ? fetchOpenCitationsReferences(doi, logEntry) : undefined;
+    if (dataCrossref && !dataCrossref.abstract && !storedData?.abstract) {
+        dataOpenAlex = await fetchOpenAlex(doi, logEntry);
+    }
+
     let data;
     try {
         data = mergeMetadata(doi, dataCrossref, dataDataCite, dataOpenCitationsMeta, dataOpenAlex);
@@ -450,10 +477,9 @@ const refreshPublicationData = async ({ doi, cachedEntry, noCache, logEntry }) =
         return { error: "Error processing metadata: " + error };
     }
 
-    const tooManyCitations = dataCrossref
-        ? dataCrossref["is-referenced-by-count"] >= MAX_CITATIONS
-        : Boolean(storedData?.tooManyCitations);
-    const citationsUpToDate = await addOpenCitations(doi, data, tooManyCitations, logEntry);
+    const citationsUpToDate = await citationsLookup;
+    Object.assign(data, citationData);
+    data.reference ||= await referencesLookup;
 
     // remove undefined/empty properties from data
     Object.keys(data).forEach(key => (data[key] === undefined || data[key] === '') && delete data[key]);

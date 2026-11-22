@@ -28,6 +28,7 @@ PROVIDERS = [
     ("openAlex", "OpenAlex", "status"),
     ("dataCite", "DataCite", "status"),
     ("openCitations", "OpenCitations Citations", "statusCitations"),
+    ("openCitationsReferences", "OpenCitations References", "status"),
 ]
 
 CACHE_TAGS = [
