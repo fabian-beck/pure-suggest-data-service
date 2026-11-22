@@ -25,6 +25,10 @@ const PREFETCH_MAX_ENQUEUES_PER_REQUEST = Number(process.env.PREFETCH_MAX_ENQUEU
 const PREFETCH_REQUEUE_COOLDOWN_MS = Number(process.env.PREFETCH_REQUEUE_COOLDOWN_MS || 24 * 60 * 60 * 1000);
 const PREFETCH_SIGNAL_TASK_DOIS_PER_REQUEST = Math.max(1, Number(process.env.PREFETCH_SIGNAL_TASK_DOIS_PER_REQUEST || 10));
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Retry delays after a Crossref outage and after an otherwise incomplete result
+const CROSSREF_RETRY_MS = 15 * 60 * 1000;
+const INCOMPLETE_RETRY_MS = DAY_MS;
 // Citation lists are only loaded for publications with fewer citations
 const MAX_CITATIONS = 1000;
 // Metadata sources, best first
@@ -148,10 +152,17 @@ const getCrossrefBackoffUntil = response => {
     return new Date(Date.now() + CROSSREF_BACKOFF_MS);
 };
 
-const getCacheExpireDate = isComplete => {
-    const expireDate = new Date();
-    expireDate.setDate(expireDate.getDate() + (isComplete ? 30 : 1));
-    return expireDate;
+// Younger publications still gain citations quickly and get their metadata completed,
+// so they are refreshed more often; a publication without year uses the middle tier.
+const getRefreshIntervals = year => {
+    const age = new Date().getFullYear() - Number(year);
+    if (age <= 1) {
+        return { citations: 7 * DAY_MS, metadata: 30 * DAY_MS };
+    }
+    if (age > 5) {
+        return { citations: 90 * DAY_MS, metadata: 365 * DAY_MS };
+    }
+    return { citations: 30 * DAY_MS, metadata: 180 * DAY_MS };
 };
 
 const fetchJson = async ({ url, headers, logEntry, logKey, statusField = "status", timeoutMs = PROVIDER_FETCH_TIMEOUT_MS }) => {
@@ -180,12 +191,6 @@ const fetchJson = async ({ url, headers, logEntry, logKey, statusField = "status
     } finally {
         clearTimeout(timeout);
     }
-};
-
-const getShortRetryExpireDate = () => {
-    const expireDate = new Date();
-    expireDate.setMinutes(expireDate.getMinutes() + 15);
-    return expireDate;
 };
 
 const fetchCrossref = async (doi, logEntry) => {
@@ -388,12 +393,16 @@ const mergeWithStoredData = (data, source, storedEntry) => {
     return { data: merged, source: freshWins ? source : storedSource };
 };
 
-const refreshPublicationData = async ({ doi, cachedEntry, logEntry }) => {
+const refreshPublicationData = async ({ doi, cachedEntry, noCache, logEntry }) => {
     const storedData = hasMetadata(cachedEntry?.data) ? cachedEntry.data : null;
-    const crossref = await fetchCrossref(doi, logEntry);
+    const now = Date.now();
+    // Citations are refreshed every time, the metadata of a Crossref record only at its longer interval
+    const metadataDue = noCache || !storedData || cachedEntry.source !== "Crossref"
+        || !(now - cachedEntry.metadataFetchedAt < getRefreshIntervals(storedData.year).metadata);
+    const crossref = metadataDue ? await fetchCrossref(doi, logEntry) : { data: null, transientFailure: false };
     const dataCrossref = crossref.data;
     // A stored record bridges a Crossref outage, so the weaker fallback sources are not needed then
-    const useFallbacks = !dataCrossref && !(crossref.transientFailure && storedData);
+    const useFallbacks = metadataDue && !dataCrossref && !(crossref.transientFailure && storedData);
     let dataOpenCitationsMeta = null;
     let dataOpenAlex = null;
     let dataDataCite = null;
@@ -413,7 +422,7 @@ const refreshPublicationData = async ({ doi, cachedEntry, logEntry }) => {
             : hasMetadata(dataOpenAlex) ? "OpenAlex"
                 : dataDataCite ? "DataCite" : "none";
 
-    logEntry.metadataSource = metadataSource;
+    logEntry.metadataSource = metadataDue ? metadataSource : "stored";
 
     let data;
     try {
@@ -446,13 +455,23 @@ const refreshPublicationData = async ({ doi, cachedEntry, logEntry }) => {
     }
 
     logEntry.cacheWrite = crossref.transientFailure && storedData ? "preserved-stale" : "stored";
-    await store.writePublicationEntry(doi, {
-        expireAt: crossref.transientFailure
-            ? getShortRetryExpireDate()
-            : getCacheExpireDate(hasMetadata(data) && citationsUpToDate),
-        data: data,
-        source: source
-    });
+    const entry = { data: data, source: source };
+    if (hasMetadata(data)) {
+        const metadataFetchedAt = metadataDue && !crossref.transientFailure ? new Date(now) : cachedEntry?.metadataFetchedAt;
+        const citationsFetchedAt = citationsUpToDate ? new Date(now) : cachedEntry?.citationsFetchedAt;
+        if (metadataFetchedAt) {
+            entry.metadataFetchedAt = metadataFetchedAt;
+        }
+        if (citationsFetchedAt) {
+            entry.citationsFetchedAt = citationsFetchedAt;
+        }
+        entry.refreshAfter = new Date(now + (crossref.transientFailure ? CROSSREF_RETRY_MS
+            : (citationsUpToDate ? getRefreshIntervals(data.year).citations : INCOMPLETE_RETRY_MS)));
+    } else {
+        // Only entries without metadata expire, so a Firestore TTL policy on this field never deletes data
+        entry.expireAt = new Date(now + INCOMPLETE_RETRY_MS);
+    }
+    await store.writePublicationEntry(doi, entry);
 
     return data;
 };
@@ -727,7 +746,7 @@ const loadPublicationData = async ({ doi, refreshCache, noCache, collectPrefetch
 
     const cachedEntry = await store.readPublicationEntry(doi);
     const cachedData = cachedEntry?.data;
-    const cachedExpireAt = cachedEntry?.expireAt;
+    const cachedExpireAt = cachedEntry?.refreshAfter ?? cachedEntry?.expireAt;
 
     if (!bypassCache && cachedExpireAt > new Date()) {
         logEntry.tag = "cache-hit";
@@ -760,7 +779,7 @@ const loadPublicationData = async ({ doi, refreshCache, noCache, collectPrefetch
         logEntry.cacheExpireAt = cachedExpireAt.toISOString();
     }
 
-    const data = await refreshPublicationData({ doi, cachedEntry, logEntry });
+    const data = await refreshPublicationData({ doi, cachedEntry, noCache, logEntry });
     await maybeRecordPrefetchSignals(data);
     return { data: data, logEntry: logEntry, timeStart: timeStart };
 };
@@ -993,6 +1012,7 @@ module.exports.__test = {
     hasMetadata,
     isTransientCrossrefStatus,
     loadBulkPublicationData,
+    loadPublicationData,
     processPrefetchSignalTask,
     mergeMetadata,
     normalizeDoi,

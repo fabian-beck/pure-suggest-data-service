@@ -36,7 +36,21 @@ Each DOI has one record in the `pure-publications` Firestore collection (accesse
 - While Crossref is unavailable, a stored record is kept as is (only its citations are updated) and Crossref is retried after 15 minutes.
 - If the citation lookup fails, the stored citations are kept and the record is refreshed again after a day.
 
-`noCache=true` forces such a refresh for the requested DOIs; the response is the merged record.
+`noCache=true` forces such a refresh for the requested DOIs, including the metadata; the response is the merged record.
+
+### Refresh schedule
+
+A record with metadata is never discarded. It is served as stored until its `refreshAfter` date; after that, the next request still gets the stored record and queues a background refresh. Each refresh updates the citations, while the metadata of a Crossref record is only fetched again at a longer interval (`getRefreshIntervals` in `index.js`):
+
+| Publication age | Citations | Metadata |
+| --- | --- | --- |
+| up to 1 year | 7 days | 30 days |
+| up to 5 years, or unknown | 30 days | 180 days |
+| older | 90 days | 365 days |
+
+Records from a fallback source ask Crossref again on every refresh. `metadataFetchedAt` and `citationsFetchedAt` record the last successful lookups.
+
+Only entries without metadata (unknown DOIs) carry an `expireAt` date and are looked up again after a day. If the collection has a Firestore TTL policy on `expireAt`, it removes just these entries; records written before this schedule still carry `expireAt` until their next refresh, so the policy should be removed if stored data is to be kept (`gcloud firestore fields ttls list`).
 
 ## Prefetching
 
