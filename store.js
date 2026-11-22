@@ -17,12 +17,8 @@ const readPublicationEntry = async doi => {
     if (!doc.exists) {
         return null;
     }
-    const entry = doc.data();
-    return {
-        ...entry,
-        expireAt: entry.expireAt?.toDate?.(),
-        refreshQueuedAt: entry.refreshQueuedAt?.toDate?.()
-    };
+    // Timestamps are handed out as dates
+    return Object.fromEntries(Object.entries(doc.data()).map(([key, value]) => [key, value?.toDate?.() ?? value]));
 };
 
 const writePublicationEntry = (doi, entry) => publicationRef(doi).set(entry);
