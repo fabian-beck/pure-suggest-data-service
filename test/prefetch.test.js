@@ -68,6 +68,32 @@ test('a source is only counted once', async () => {
     assert.equal(context.signalCount, 0);
 });
 
+test('a source listed twice in one task is only counted once', async () => {
+    const state = stubStore(new Map([['10.s/one', sourceEntry('10.s/one', '10.t/shared')]]));
+    stubProviders(cloudTasksRoutes);
+
+    await recordSignals(['10.s/one', '10.s/one']);
+
+    assert.equal(state.candidates.get('10.t/shared').uniqueSourceCount, 1);
+});
+
+test('a source that does not fit into the signal budget is left for a later request', async () => {
+    const targets = count => Array.from({ length: count }, (_, index) => `10.t/${count}-${index}`).join('; ');
+    const state = stubStore(new Map([
+        ['10.s/one', sourceEntry('10.s/one', targets(50), targets(49))],
+        ['10.s/two', sourceEntry('10.s/two', targets(48), targets(47))],
+        ['10.s/three', sourceEntry('10.s/three', targets(46), targets(45))]
+    ]));
+    stubProviders(cloudTasksRoutes);
+
+    const context = await recordSignals(['10.s/one', '10.s/two', '10.s/three']);
+
+    assert.equal(context.signalCount, 99 + 95);
+    assert.ok(state.entries.get('10.s/two').prefetchSignalsAt);
+    assert.equal(state.entries.get('10.s/three').prefetchSignalsAt, undefined);
+    assert.equal(state.candidates.has('10.t/46-0'), false);
+});
+
 test('a target that is already stored is not prefetched', async () => {
     const state = stubStore(new Map([
         ['10.s/two', sourceEntry('10.s/two', '10.t/stored')],
@@ -128,6 +154,17 @@ test('a loaded publication reports whether its prefetch signals are still to be 
     assert.equal((await loadPublicationData({ doi: '10.s/new' })).needsPrefetchSignals, true);
     assert.equal((await loadPublicationData({ doi: '10.s/recorded' })).needsPrefetchSignals, false);
     assert.equal((await loadPublicationData({ doi: '10.s/unknown' })).needsPrefetchSignals, false);
+});
+
+test('a newly loaded publication needs its prefetch signals recorded only if it has targets', async () => {
+    stubStore();
+    stubProviders({
+        'works/10.s/with-references': { message: { title: ['A title'], reference: [{ DOI: '10.t/a' }] } },
+        'works/10.s/alone': { message: { title: ['A title'] } }
+    });
+
+    assert.equal((await loadPublicationData({ doi: '10.s/with-references' })).needsPrefetchSignals, true);
+    assert.equal((await loadPublicationData({ doi: '10.s/alone' })).needsPrefetchSignals, false);
 });
 
 test('a refresh keeps the mark of recorded prefetch signals', async () => {

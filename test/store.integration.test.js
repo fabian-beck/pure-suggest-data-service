@@ -62,7 +62,7 @@ test('a loaded publication is stored and then served without provider requests',
     assert.equal(entry.expireAt, undefined);
 });
 
-test('prefetch signals count each source once per target and mark the source', { skip }, async () => {
+test('prefetch signals add one count per source to each target and mark the source', { skip }, async () => {
     const targets = ['10.1234/Integration.Target.A', '10.1234/Integration.Target.B'].map(store.normalizeDoi);
     await Promise.all(targets.map(doi => store.prefetchCandidateRef(doi).delete()));
     await store.writePublicationEntry(DOI, { data: { doi: DOI, title: 'A title' }, source: 'Crossref' });
@@ -91,4 +91,38 @@ test('prefetch signals count each source once per target and mark the source', {
     assert.ok(source.prefetchSignalsAt instanceof Date);
     assert.equal(source.data.title, 'A title');
     await store.publicationRef('10.1234/other.source').delete();
+});
+
+test('a source recorded by two tasks at the same time is counted once', { skip }, async () => {
+    const target = '10.1234/integration.target.c';
+    await store.prefetchCandidateRef(target).delete();
+    await store.writePublicationEntry(DOI, { data: { doi: DOI, title: 'A title' }, source: 'Crossref' });
+    const signals = [{ doi: target, relationTypes: ['reference'], status: 'candidate' }];
+
+    const recorded = await Promise.all([
+        store.writePrefetchSignals(DOI, signals),
+        store.writePrefetchSignals(DOI, signals)
+    ]);
+    const [candidate] = await store.readPrefetchCandidates([target]);
+
+    assert.deepEqual([...recorded].sort(), [false, true]);
+    assert.equal(candidate.uniqueSourceCount, 1);
+    assert.equal(await store.writePrefetchSignals(DOI, signals), false);
+});
+
+test('rewriting a record replaces its fields but keeps the prefetch marker', { skip }, async () => {
+    await store.writePublicationEntry(DOI, {
+        data: { doi: DOI, title: 'A title', tooManyCitations: true },
+        source: 'OpenAlex',
+        expireAt: new Date()
+    });
+    await store.markRefreshQueued(DOI);
+    await store.writePrefetchSignals(DOI, []);
+
+    await store.writePublicationEntry(DOI, { data: { doi: DOI, title: 'New title' }, source: 'Crossref' });
+    const entry = await store.readPublicationEntry(DOI);
+
+    assert.deepEqual(entry.data, { doi: DOI, title: 'New title' });
+    assert.ok(entry.prefetchSignalsAt instanceof Date);
+    assert.deepEqual(Object.keys(entry).sort(), ['data', 'prefetchSignalsAt', 'source']);
 });

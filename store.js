@@ -3,7 +3,7 @@
 const { Firestore, FieldValue } = require('@google-cloud/firestore');
 const firestore = new Firestore();
 
-const WRITE_BATCH_SIZE = 200;
+const PUBLICATION_FIELDS = ['data', 'source', 'metadataFetchedAt', 'citationsFetchedAt', 'refreshAfter', 'expireAt', 'refreshQueuedAt'];
 
 const normalizeDoi = doi => String(doi ?? "").trim().toLowerCase();
 const toDoiDocId = doi => normalizeDoi(doi).replace(/\//g, '\\');
@@ -23,7 +23,12 @@ const readPublicationEntry = async doi => toEntry(await publicationRef(doi).get(
 
 const readPublicationEntries = dois => readAll(dois.map(publicationRef));
 
-const writePublicationEntry = (doi, entry) => publicationRef(doi).set(entry);
+// Replaces the listed fields of the record (absent ones are removed) and leaves the
+// prefetch marker alone, which a signal task may have written since the record was read.
+const writePublicationEntry = (doi, entry) => publicationRef(doi).set(
+    Object.fromEntries(PUBLICATION_FIELDS.map(field => [field, entry[field] ?? FieldValue.delete()])),
+    { mergeFields: PUBLICATION_FIELDS }
+);
 
 const markRefreshQueued = doi => publicationRef(doi)
     .set({ refreshQueuedAt: FieldValue.serverTimestamp() }, { merge: true });
@@ -35,33 +40,32 @@ const writeCrossrefBackoff = state => crossrefStateRef
 
 const readPrefetchCandidates = dois => readAll(dois.map(prefetchCandidateRef));
 
-// Counts the source once for each signal's target and marks the source as recorded.
+// Counts the source once for each signal's target and marks the source as recorded, unless it
+// already is; resolves to whether the signals were recorded.
 // A signal is { doi, relationTypes, status }; without status, the candidate keeps its status.
-const writePrefetchSignals = async (sourceDoi, signals) => {
-    for (let start = 0; start < signals.length; start += WRITE_BATCH_SIZE) {
-        const batch = firestore.batch();
-        signals.slice(start, start + WRITE_BATCH_SIZE).forEach(signal => {
-            const update = {
-                doi: signal.doi,
-                uniqueSourceCount: FieldValue.increment(1),
-                lastSeenAt: FieldValue.serverTimestamp(),
-                lastSourceDoi: sourceDoi,
-                relationTypes: FieldValue.arrayUnion(...signal.relationTypes)
-            };
-            if (signal.status) {
-                update.status = signal.status;
-            }
-            if (signal.status === "queued") {
-                update.queuedAt = FieldValue.serverTimestamp();
-            }
-            batch.set(prefetchCandidateRef(signal.doi), update, { merge: true });
-        });
-        if (start + WRITE_BATCH_SIZE >= signals.length) {
-            batch.set(publicationRef(sourceDoi), { prefetchSignalsAt: FieldValue.serverTimestamp() }, { merge: true });
-        }
-        await batch.commit();
+const writePrefetchSignals = (sourceDoi, signals) => firestore.runTransaction(async transaction => {
+    if ((await transaction.get(publicationRef(sourceDoi))).data()?.prefetchSignalsAt) {
+        return false;
     }
-};
+    signals.forEach(signal => {
+        const update = {
+            doi: signal.doi,
+            uniqueSourceCount: FieldValue.increment(1),
+            lastSeenAt: FieldValue.serverTimestamp(),
+            lastSourceDoi: sourceDoi,
+            relationTypes: FieldValue.arrayUnion(...signal.relationTypes)
+        };
+        if (signal.status) {
+            update.status = signal.status;
+        }
+        if (signal.status === "queued") {
+            update.queuedAt = FieldValue.serverTimestamp();
+        }
+        transaction.set(prefetchCandidateRef(signal.doi), update, { merge: true });
+    });
+    transaction.set(publicationRef(sourceDoi), { prefetchSignalsAt: FieldValue.serverTimestamp() }, { merge: true });
+    return true;
+});
 
 const markPrefetchCandidate = (doi, update) => prefetchCandidateRef(doi).set(update, { merge: true });
 

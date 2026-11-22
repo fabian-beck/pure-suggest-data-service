@@ -11,6 +11,9 @@ const stubStore = (entries = new Map()) => {
     store.readPublicationEntries = async dois => dois.map(doi => entries.get(doi) ?? null);
     store.readPrefetchCandidates = async dois => dois.map(doi => state.candidates.get(doi) ?? null);
     store.writePrefetchSignals = async (sourceDoi, signals) => {
+        if (entries.get(sourceDoi)?.prefetchSignalsAt) {
+            return false;
+        }
         signals.forEach(signal => {
             const candidate = state.candidates.get(signal.doi) ?? { uniqueSourceCount: 0 };
             state.candidates.set(signal.doi, {
@@ -21,12 +24,14 @@ const stubStore = (entries = new Map()) => {
             });
         });
         entries.set(sourceDoi, { ...entries.get(sourceDoi), prefetchSignalsAt: new Date() });
+        return true;
     };
     store.markPrefetchCandidate = async (doi, update) => {
         state.candidates.set(doi, { ...state.candidates.get(doi), ...update });
     };
     store.writePublicationEntry = async (doi, entry) => {
-        entries.set(doi, entry);
+        const prefetchSignalsAt = entries.get(doi)?.prefetchSignalsAt;
+        entries.set(doi, prefetchSignalsAt ? { ...entry, prefetchSignalsAt } : entry);
     };
     store.markRefreshQueued = async doi => {
         entries.set(doi, { ...entries.get(doi), refreshQueuedAt: new Date() });

@@ -353,7 +353,7 @@ const addOpenCitations = async (doi, data, tooManyCitations, logEntry) => {
             logKey: "openCitations",
             statusField: "statusCitations"
         });
-        citations.data?.forEach(reference => {
+        (Array.isArray(citations.data) ? citations.data : []).forEach(reference => {
             // extract doi from citing
             const doi = reference.citing?.match(/doi:(\S*)\s?/i)?.[1];
             if (doi) {
@@ -449,9 +449,6 @@ const refreshPublicationData = async ({ doi, cachedEntry, noCache, logEntry }) =
 
     logEntry.cacheWrite = crossref.transientFailure && storedData ? "preserved-stale" : "stored";
     const entry = { data: data, source: source };
-    if (cachedEntry?.prefetchSignalsAt) {
-        entry.prefetchSignalsAt = cachedEntry.prefetchSignalsAt;
-    }
     if (hasMetadata(data)) {
         const metadataFetchedAt = metadataDue && !crossref.transientFailure ? new Date(now) : cachedEntry?.metadataFetchedAt;
         const citationsFetchedAt = citationsUpToDate ? new Date(now) : cachedEntry?.citationsFetchedAt;
@@ -555,17 +552,13 @@ const enqueuePrefetchSignalTasks = async ({ dois, dependencies = {} }) => {
 // and queues a prefetch for targets that reached the signal threshold. This happens once per
 // source (marked on its stored record), which is what makes the counts distinct sources.
 const recordPrefetchSignals = async ({ sourceDoi, data, context, logEntry }) => {
-    const remainingSignals = Math.max(0, PREFETCH_MAX_SIGNALS_PER_REQUEST - context.signalCount);
     const allTargets = getPrefetchTargetsByRelation(data).filter(target => target.doi !== sourceDoi);
-    const targets = allTargets.slice(0, remainingSignals);
-
-    if (targets.length === 0) {
-        if (allTargets.length > 0) {
-            logEntry.prefetch = { signalCount: 0, budgetExhausted: true };
-        }
+    // A source is recorded as a whole; one that does not fit into the rest of the budget waits for a later request
+    if (context.signalCount > 0 && context.signalCount + allTargets.length > PREFETCH_MAX_SIGNALS_PER_REQUEST) {
+        logEntry.prefetch = { signalCount: 0, budgetExhausted: true };
         return;
     }
-    context.signalCount += targets.length;
+    const targets = allTargets.slice(0, PREFETCH_MAX_SIGNALS_PER_REQUEST);
 
     const candidates = await store.readPrefetchCandidates(targets.map(target => target.doi));
     const cooldownStart = new Date(Date.now() - PREFETCH_REQUEUE_COOLDOWN_MS);
@@ -589,7 +582,10 @@ const recordPrefetchSignals = async ({ sourceDoi, data, context, logEntry }) => 
         }
         return { doi: target.doi, relationTypes: target.relationTypes, status: status };
     });
-    await store.writePrefetchSignals(sourceDoi, signals);
+    if (!await store.writePrefetchSignals(sourceDoi, signals)) {
+        return;
+    }
+    context.signalCount += signals.length;
 
     const summary = {
         signalCount: signals.length,
@@ -598,9 +594,6 @@ const recordPrefetchSignals = async ({ sourceDoi, data, context, logEntry }) => 
         cachedCount: storedDois.size,
         enqueueErrorCount: 0
     };
-    if (allTargets.length > targets.length) {
-        summary.budgetExhausted = true;
-    }
     for (const signal of signals.filter(signal => signal.status === "queued")) {
         try {
             await enqueuePrefetchTask({ doi: signal.doi });
@@ -640,7 +633,7 @@ const loadPublicationData = async ({ doi, refreshCache, noCache }) => {
         data: data,
         logEntry: logEntry,
         timeStart: timeStart,
-        needsPrefetchSignals: hasMetadata(data) && !cachedEntry?.prefetchSignalsAt
+        needsPrefetchSignals: Boolean(data?.reference || data?.citation) && !cachedEntry?.prefetchSignalsAt
     });
 
     if (!bypassCache && cachedExpireAt > new Date()) {
@@ -682,7 +675,8 @@ const logRequest = (logEntry, data, timeStart) => {
 };
 
 // Records the prefetch signals of stored publications that have not been counted as a source yet.
-const processPrefetchSignalTask = async ({ dois, prefetchContext }) => {
+const processPrefetchSignalTask = async ({ dois: requestedDois, prefetchContext }) => {
+    const dois = [...new Set(requestedDois)];
     const entries = await store.readPublicationEntries(dois);
 
     for (const [index, doi] of dois.entries()) {
