@@ -9,6 +9,18 @@ npm install
 gcloud init
 ```
 
+## Tests
+
+```
+npm test
+```
+
+Provider requests and Firestore are stubbed (`test/helpers.js`). The tests in `test/store.integration.test.js` use the real Firestore access and only run against the Firestore emulator:
+
+```
+npx firebase-tools emulators:exec --only firestore --project demo-pure "npm test"
+```
+
 ## API
 
 Single DOI lookup remains unchanged:
